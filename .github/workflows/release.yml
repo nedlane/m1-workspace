@@ -1,0 +1,45 @@
+name: Release tag
+
+# Auto-creates the git tag (and a GitHub Release for visibility) whenever the
+# crate version in Cargo.toml changes. m1-workspace is a library crate consumed
+# via Cargo git-tag deps (built from source), so NO binaries are attached — the
+# deliverable is the tag itself. This closes the "bumped the version but forgot
+# to push the tag" gap, so downstream consumers (m1-typecheck/m1-lsp) can always
+# resolve `tag = "vX.Y.Z"`.
+#
+# Idempotent: if the release for the current Cargo.toml version already exists,
+# it does nothing. Runnable manually (workflow_dispatch) to recover a dropped
+# push webhook. The version is read from Cargo.toml [package].version (the
+# canonical source; Cargo.lock just mirrors it).
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Tag + release on version change
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')
+          TAG="v$VERSION"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG already exists — nothing to do."
+            exit 0
+          fi
+          echo "Creating $TAG (tag + release) at $GITHUB_SHA"
+          # If the tag already exists, gh attaches the release to it; otherwise
+          # it creates the tag at the current commit.
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "m1-workspace $TAG" \
+            --generate-notes
