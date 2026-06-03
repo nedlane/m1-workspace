@@ -42,3 +42,9 @@ if let Some(prj) = m1_workspace::find_project_file(Path::new("UQR-EV/01.00")) {
 ## License
 
 GPL-3.0-or-later — see [LICENSE](LICENSE).
+
+## Trademark
+
+Independent, community-built open-source tooling for the MoTeC® M1 script
+language. Not affiliated with, authorised, or endorsed by MoTeC Pty Ltd.
+"MoTeC" and "M1" are trademarks of MoTeC Pty Ltd.
