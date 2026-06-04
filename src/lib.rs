@@ -8,6 +8,12 @@
 //! copy of these rules; this crate is the single source of truth so a fix lands
 //! in one place.
 
+mod decode;
+pub use decode::{
+    Encoding, decode, decode_with_encoding, encode, read_motec_xml, read_text,
+    read_text_with_encoding,
+};
+
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
@@ -81,15 +87,32 @@ pub fn strip_root(path: &str) -> &str {
     path.strip_prefix(ROOT_PREFIX).unwrap_or(path)
 }
 
+/// `std::fs::read_dir`, but treat an *empty* path as the current directory.
+///
+/// A bare relative project filename (`Project.m1prj`) has
+/// `Path::parent() == Some("")`, and `read_dir("")` errors with ENOENT where
+/// `read_dir(".")` succeeds. The cfg/dbc ancestor walk fed that empty parent
+/// straight to `read_dir`, so a project invoked as `--project Project.m1prj`
+/// (vs `./Project.m1prj`) silently found no `.m1cfg`/`.m1dbc` — making
+/// m1-typecheck's T041/T042 no-op (see m1-typecheck#87).
+fn read_dir_normalized(dir: &Path) -> std::io::Result<std::fs::ReadDir> {
+    let dir = if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    };
+    std::fs::read_dir(dir)
+}
+
 fn first_with_ext(dir: &Path, ext: &str) -> Option<PathBuf> {
-    std::fs::read_dir(dir).ok()?.flatten().find_map(|e| {
+    read_dir_normalized(dir).ok()?.flatten().find_map(|e| {
         let p = e.path();
         (p.extension().and_then(|x| x.to_str()) == Some(ext)).then_some(p)
     })
 }
 
 fn walk_ext(dir: &Path, ext: &str, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
+    let Ok(entries) = read_dir_normalized(dir) else {
         return;
     };
     for e in entries.flatten() {
@@ -148,6 +171,14 @@ mod tests {
         fs::write(root.join("c.txt"), "").unwrap();
         let found = find_dbc_files(root);
         assert_eq!(found, vec![sub.join("a.m1dbc"), sub.join("b.m1dbc")]);
+    }
+
+    #[test]
+    fn read_dir_normalized_treats_empty_path_as_cwd() {
+        // `read_dir("")` errors (ENOENT); the helper reads "." instead, so the
+        // cfg/dbc ancestor walk reaches the cwd for a bare relative project name.
+        assert!(std::fs::read_dir(Path::new("")).is_err());
+        assert!(read_dir_normalized(Path::new("")).is_ok());
     }
 
     #[test]
