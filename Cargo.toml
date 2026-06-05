@@ -1,6 +1,6 @@
 [package]
 name = "m1-workspace"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
 description = "Shared filesystem and path conventions for the MoTeC M1 toolchain"
