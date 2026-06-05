@@ -32,10 +32,26 @@ pub enum Encoding {
     Windows1252,
 }
 
+/// Upper bound on the size of a MoTeC text file the toolchain will read into
+/// memory. Real M1 files are tens-to-hundreds of KB (the largest in the
+/// reference corpus is a ~450 KB `Project.m1prj`); 64 MiB is ample headroom. A
+/// larger file fails fast with `InvalidData` instead of attempting a
+/// multi-gigabyte allocation — an OOM/DoS vector for batch runs and the
+/// long-lived LSP (m1-workspace#8).
+pub const MAX_TEXT_FILE_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Read a file as text, decoding UTF-8 with a Windows-1252 fallback. General
 /// helper for any MoTeC text file (`.m1scr`, `.m1prj`, `.m1cfg`, `.m1dbc`).
+/// Files larger than [`MAX_TEXT_FILE_BYTES`] are rejected.
 pub fn read_text(path: &Path) -> io::Result<String> {
-    Ok(decode(std::fs::read(path)?))
+    read_text_capped(path, MAX_TEXT_FILE_BYTES)
+}
+
+/// Like [`read_text`] but with a caller-supplied size cap (in bytes). A file
+/// larger than `max_bytes` returns `ErrorKind::InvalidData` after a cheap
+/// metadata check, before any large allocation.
+pub fn read_text_capped(path: &Path, max_bytes: u64) -> io::Result<String> {
+    Ok(decode(read_bytes_capped(path, max_bytes)?))
 }
 
 /// Read a MoTeC XML file as text. Currently identical to [`read_text`]; kept as
@@ -45,9 +61,26 @@ pub fn read_motec_xml(path: &Path) -> io::Result<String> {
 }
 
 /// Read a file as text, also reporting the encoding it was decoded from, so a
-/// writer can round-trip it via [`encode`] in the same encoding.
+/// writer can round-trip it via [`encode`] in the same encoding. Subject to the
+/// same [`MAX_TEXT_FILE_BYTES`] size cap as [`read_text`].
 pub fn read_text_with_encoding(path: &Path) -> io::Result<(String, Encoding)> {
-    Ok(decode_with_encoding(std::fs::read(path)?))
+    Ok(decode_with_encoding(read_bytes_capped(
+        path,
+        MAX_TEXT_FILE_BYTES,
+    )?))
+}
+
+/// Read a file's raw bytes, rejecting anything larger than `max_bytes` via a
+/// metadata pre-check so an oversized input fails fast instead of OOMing.
+fn read_bytes_capped(path: &Path, max_bytes: u64) -> io::Result<Vec<u8>> {
+    let len = std::fs::metadata(path)?.len();
+    if len > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("file is {len} bytes, exceeding the {max_bytes}-byte read limit"),
+        ));
+    }
+    std::fs::read(path)
 }
 
 /// Decode bytes as UTF-8, falling back to Windows-1252 if they are not valid
@@ -60,6 +93,16 @@ pub fn decode(bytes: Vec<u8>) -> String {
 /// (m1-project) needs this to re-encode on write-back instead of transcoding a
 /// Windows-1252 file to UTF-8 behind MoTeC's back.
 pub fn decode_with_encoding(bytes: Vec<u8>) -> (String, Encoding) {
+    // Strip a leading UTF-8 BOM (EF BB BF) so the decoded text begins with the
+    // document's first real character, not U+FEFF — a stray BOM shifts
+    // diagnostic columns and breaks strict leading-token checks, and on the
+    // Windows-1252 fallback below would otherwise mojibake to `ï»¿`
+    // (m1-workspace#9). Copies only when a BOM is actually present.
+    let bytes = if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        bytes[3..].to_vec()
+    } else {
+        bytes
+    };
     match String::from_utf8(bytes) {
         Ok(s) => (s, Encoding::Utf8),
         // `into_bytes` reuses the original buffer (no UTF-8 was produced).
@@ -77,6 +120,70 @@ pub fn encode(s: &str, encoding: Encoding) -> Vec<u8> {
     match encoding {
         Encoding::Utf8 => s.as_bytes().to_vec(),
         Encoding::Windows1252 => s.chars().map(char_to_cp1252).collect(),
+    }
+}
+
+/// The characters a target encoding cannot represent, returned by
+/// [`encode_checked`] so a writer can refuse a lossy write instead of silently
+/// substituting `'?'`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LossyEncoding {
+    /// The distinct un-representable characters, in first-seen order.
+    pub unrepresentable: Vec<char>,
+}
+
+impl std::fmt::Display for LossyEncoding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let list: Vec<String> = self
+            .unrepresentable
+            .iter()
+            .map(|c| format!("{c:?} (U+{:04X})", *c as u32))
+            .collect();
+        write!(
+            f,
+            "{} character(s) cannot be represented in Windows-1252: {}",
+            self.unrepresentable.len(),
+            list.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for LossyEncoding {}
+
+/// Like [`encode`], but instead of silently substituting `'?'` for characters
+/// the target encoding cannot represent, returns [`LossyEncoding`] listing them.
+///
+/// UTF-8 can represent every `char`, so it never fails. Use this on a
+/// write-back path (e.g. m1-project rewriting a Windows-1252 `Project.m1prj`) so
+/// a user-supplied value outside Windows-1252 — an ohm `Ω`, an arrow, CJK — is
+/// reported and the write refused, rather than persisted as `'?'`
+/// (m1-workspace#6).
+pub fn encode_checked(s: &str, encoding: Encoding) -> Result<Vec<u8>, LossyEncoding> {
+    match encoding {
+        Encoding::Utf8 => Ok(s.as_bytes().to_vec()),
+        Encoding::Windows1252 => {
+            let mut out = Vec::with_capacity(s.len());
+            let mut bad: Vec<char> = Vec::new();
+            for c in s.chars() {
+                let b = char_to_cp1252(c);
+                // `char_to_cp1252` returns `b'?'` both for a literal '?' and for
+                // any character it cannot represent; only the latter is lossy.
+                if b == b'?' && c != '?' {
+                    if !bad.contains(&c) {
+                        bad.push(c);
+                    }
+                } else {
+                    out.push(b);
+                }
+            }
+            if bad.is_empty() {
+                Ok(out)
+            } else {
+                Err(LossyEncoding {
+                    unrepresentable: bad,
+                })
+            }
+        }
     }
 }
 
@@ -217,5 +324,51 @@ mod tests {
     fn encode_windows_1252_unrepresentable_char_becomes_question_mark() {
         // An emoji can't exist in a 1252 file; encoding it is defined as '?'.
         assert_eq!(encode("a🚗b", Encoding::Windows1252), b"a?b");
+    }
+
+    #[test]
+    fn utf8_bom_is_stripped() {
+        // #9: a leading UTF-8 BOM must not survive into the decoded string.
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(b"<Project/>");
+        let (s, enc) = decode_with_encoding(bytes);
+        assert_eq!(enc, Encoding::Utf8);
+        assert_eq!(s, "<Project/>");
+        assert!(!s.starts_with('\u{FEFF}'));
+    }
+
+    #[test]
+    fn encode_checked_reports_unrepresentable_char() {
+        // #6: ohm Ω (U+03A9) is outside Windows-1252; it must be reported, not
+        // silently turned into '?'.
+        let err = encode_checked("12 Ω", Encoding::Windows1252).unwrap_err();
+        assert_eq!(err.unrepresentable, vec!['\u{03A9}']);
+    }
+
+    #[test]
+    fn encode_checked_allows_latin1_and_literal_question_mark() {
+        // Everyday CP1252 symbols and a *literal* '?' must encode without error.
+        let ok = encode_checked("°±µ? ok", Encoding::Windows1252).unwrap();
+        assert_eq!(ok, encode("°±µ? ok", Encoding::Windows1252));
+    }
+
+    #[test]
+    fn encode_checked_utf8_never_fails() {
+        assert_eq!(
+            encode_checked("a🚗Ω", Encoding::Utf8).unwrap(),
+            "a🚗Ω".as_bytes()
+        );
+    }
+
+    #[test]
+    fn read_text_capped_rejects_oversized_file() {
+        // #8: a file larger than the cap fails fast (no large allocation).
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("big.m1scr");
+        std::fs::write(&p, vec![b'a'; 100]).unwrap();
+        let err = read_text_capped(&p, 10).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        // A cap above the file size reads normally.
+        assert_eq!(read_text_capped(&p, 1000).unwrap().len(), 100);
     }
 }

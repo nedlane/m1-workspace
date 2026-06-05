@@ -10,8 +10,8 @@
 
 mod decode;
 pub use decode::{
-    Encoding, decode, decode_with_encoding, encode, read_motec_xml, read_text,
-    read_text_with_encoding,
+    Encoding, LossyEncoding, MAX_TEXT_FILE_BYTES, decode, decode_with_encoding, encode,
+    encode_checked, read_motec_xml, read_text, read_text_capped, read_text_with_encoding,
 };
 
 use std::borrow::Cow;
@@ -111,14 +111,36 @@ fn first_with_ext(dir: &Path, ext: &str) -> Option<PathBuf> {
     })
 }
 
+/// Maximum directory depth [`walk_ext`] descends. Real projects nest a handful
+/// of levels; this is defense-in-depth against a pathologically deep tree.
+const MAX_WALK_DEPTH: usize = 64;
+
 fn walk_ext(dir: &Path, ext: &str, out: &mut Vec<PathBuf>) {
+    walk_ext_depth(dir, ext, out, 0);
+}
+
+fn walk_ext_depth(dir: &Path, ext: &str, out: &mut Vec<PathBuf>, depth: usize) {
+    if depth > MAX_WALK_DEPTH {
+        return;
+    }
     let Ok(entries) = read_dir_normalized(dir) else {
         return;
     };
     for e in entries.flatten() {
+        // Use the dir-entry's own file type, which (unlike `Path::is_dir`/`p.is_dir`)
+        // does NOT follow symlinks. A symlink pointing outside the project tree
+        // must not be descended or read: a crafted in-tree symlink would
+        // otherwise let the tool enumerate and read `*.m1dbc`/`*.m1scr` from
+        // arbitrary host directories into the project model (m1-workspace#7).
+        let Ok(ft) = e.file_type() else {
+            continue;
+        };
+        if ft.is_symlink() {
+            continue;
+        }
         let p = e.path();
-        if p.is_dir() {
-            walk_ext(&p, ext, out);
+        if ft.is_dir() {
+            walk_ext_depth(&p, ext, out, depth + 1);
         } else if p.extension().and_then(|x| x.to_str()) == Some(ext) {
             out.push(p);
         }
@@ -171,6 +193,27 @@ mod tests {
         fs::write(root.join("c.txt"), "").unwrap();
         let found = find_dbc_files(root);
         assert_eq!(found, vec![sub.join("a.m1dbc"), sub.join("b.m1dbc")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_does_not_follow_symlinks_out_of_tree() {
+        // #7: an in-tree symlink to an out-of-tree directory must not be
+        // descended, or the tool would read arbitrary host `*.m1dbc` files.
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("proj");
+        let inside = root.join("dbc");
+        fs::create_dir_all(&inside).unwrap();
+        fs::write(inside.join("in.m1dbc"), "").unwrap();
+        // An out-of-tree directory holding a .m1dbc, reachable only via a symlink.
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("leak.m1dbc"), "").unwrap();
+        symlink(&outside, root.join("escape")).unwrap();
+        // Only the in-tree dbc is found; the `escape` symlink is not followed.
+        let found = find_dbc_files(&root);
+        assert_eq!(found, vec![inside.join("in.m1dbc")]);
     }
 
     #[test]
