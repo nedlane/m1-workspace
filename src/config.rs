@@ -31,6 +31,7 @@ pub struct LintSection {
     pub max_line_length: Option<usize>,
     pub max_nesting_depth: Option<usize>,
     pub max_complexity: Option<u32>,
+    pub max_cognitive_complexity: Option<u32>,
     pub exclude: Option<Vec<String>>,
 }
 
@@ -79,12 +80,13 @@ mod tests {
     #[test]
     fn parses_all_sections() {
         let c = M1ToolsConfig::from_toml_str(
-            "[lint]\nmax_line_length = 100\nexclude = [\"*.gen.m1scr\"]\n\
+            "[lint]\nmax_line_length = 100\nmax_cognitive_complexity = 20\nexclude = [\"*.gen.m1scr\"]\n\
              [format]\nbrace_style = \"kr\"\nindent_style = \"spaces\"\nindent_width = 2\n\
              [diagnostics]\nignore = [\"T041\"]\n",
         )
         .unwrap();
         assert_eq!(c.lint.max_line_length, Some(100));
+        assert_eq!(c.lint.max_cognitive_complexity, Some(20));
         assert_eq!(
             c.lint.exclude.as_deref(),
             Some(&["*.gen.m1scr".to_string()][..])
