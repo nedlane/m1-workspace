@@ -1,11 +1,15 @@
 [package]
 name = "m1-workspace"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
 description = "Shared filesystem and path conventions for the MoTeC M1 toolchain"
 repository = "https://github.com/nedlane/m1-workspace"
 publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 
 [dev-dependencies]
 tempfile = "3"

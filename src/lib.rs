@@ -14,6 +14,11 @@ pub use decode::{
     encode_checked, read_motec_xml, read_text, read_text_capped, read_text_with_encoding,
 };
 
+pub mod config;
+pub use config::{
+    DiagnosticsSection, FormatSection, LintSection, M1ToolsConfig, TOOLS_CONFIG_FILE,
+};
+
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
