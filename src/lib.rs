@@ -19,6 +19,15 @@ pub use config::{
     DiagnosticsSection, FormatSection, LintSection, M1ToolsConfig, TOOLS_CONFIG_FILE,
 };
 
+mod io;
+pub use io::atomic_write;
+
+mod line_index;
+pub use line_index::LineIndex;
+
+mod style;
+pub use style::{BraceStyle, IndentStyle, InvalidStyle};
+
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
