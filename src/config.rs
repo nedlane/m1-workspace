@@ -70,9 +70,12 @@ pub enum ConfigError {
     MaxNestingDepthZero,
     /// `[lint] max_cognitive_complexity` must be ≥ 1.
     MaxCognitiveComplexityZero,
+    /// `[lint] max_complexity` must be ≥ 1.
+    MaxComplexityZero,
     /// A diagnostic code in `[diagnostics] ignore` or `select` is malformed.
     ///
-    /// Valid codes match `[A-Z][0-9]{3}` (e.g. `T041`, `L010`, `E001`).
+    /// Valid codes are either tool codes matching `[A-Z][0-9]{3}` (`T041`,
+    /// `L010`) or named kebab-case codes (`syntax-error`, `unsupported-c-token`).
     MalformedDiagnosticCode(String),
 }
 
@@ -91,9 +94,12 @@ impl fmt::Display for ConfigError {
             ConfigError::MaxCognitiveComplexityZero => {
                 write!(f, "max_cognitive_complexity must be ≥ 1; got 0")
             }
+            ConfigError::MaxComplexityZero => {
+                write!(f, "max_complexity must be ≥ 1; got 0")
+            }
             ConfigError::MalformedDiagnosticCode(code) => write!(
                 f,
-                "malformed diagnostic code {code:?}; expected format: uppercase letter + 3 digits (e.g. T041, L010, E001)"
+                "malformed diagnostic code {code:?}; expected an uppercase letter + 3 digits (e.g. T041, L010) or a named code (e.g. syntax-error)"
             ),
         }
     }
@@ -101,15 +107,24 @@ impl fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
-/// Returns `true` if `code` is a valid diagnostic code: one uppercase ASCII
-/// letter followed by exactly three ASCII digits (e.g. `T041`, `L010`, `E001`).
+/// Returns `true` if `code` is a valid diagnostic code. Two shapes exist:
+/// tool codes — one uppercase ASCII letter followed by exactly three ASCII
+/// digits (`T041`, `L010`) — and the named, digit-free kebab-case codes the
+/// LSP layer publishes for m1-core diagnostics (`syntax-error`,
+/// `unsupported-c-token`). Anything else (notably lowercased or truncated
+/// tool codes like `t041`/`T41`) is a config mistake worth flagging.
 fn is_valid_diagnostic_code(code: &str) -> bool {
     let b = code.as_bytes();
-    b.len() == 4
+    let tool_code = b.len() == 4
         && b[0].is_ascii_uppercase()
         && b[1].is_ascii_digit()
         && b[2].is_ascii_digit()
-        && b[3].is_ascii_digit()
+        && b[3].is_ascii_digit();
+    let named_code = !b.is_empty()
+        && b.first().is_some_and(u8::is_ascii_lowercase)
+        && b.last().is_some_and(u8::is_ascii_lowercase)
+        && b.iter().all(|c| c.is_ascii_lowercase() || *c == b'-');
+    tool_code || named_code
 }
 
 impl M1ToolsConfig {
@@ -160,6 +175,13 @@ impl M1ToolsConfig {
             && v == 0
         {
             errors.push(ConfigError::MaxCognitiveComplexityZero);
+        }
+
+        // [lint] max_complexity (cyclomatic, L009): must be ≥ 1 when set.
+        if let Some(v) = self.lint.max_complexity
+            && v == 0
+        {
+            errors.push(ConfigError::MaxComplexityZero);
         }
 
         // [format] indent_width: must be 1..=16 when set.
@@ -352,11 +374,12 @@ mod tests {
     #[test]
     fn validate_rejects_malformed_diagnostic_codes() {
         let c = M1ToolsConfig::from_toml_str(
-            "[diagnostics]\nignore = [\"T041\", \"not-a-code\", \"t001\", \"L010\"]\n",
+            "[diagnostics]\nignore = [\"T041\", \"t001\", \"T41\", \"Syntax-Error\", \"L010\"]\n",
         )
         .unwrap();
         let errs = c.validate().unwrap_err();
-        // "not-a-code" and "t001" (lowercase) are invalid; "T041" and "L010" are valid.
+        // Lowercased/truncated tool codes and mixed-case names are config
+        // mistakes; "T041" and "L010" are valid.
         let bad: Vec<_> = errs
             .iter()
             .filter_map(|e| {
@@ -368,21 +391,41 @@ mod tests {
             })
             .collect();
         assert!(
-            bad.contains(&"not-a-code"),
-            "expected not-a-code invalid, got {errs:?}"
+            bad.contains(&"t001"),
+            "expected t001 (lowercase tool code) invalid, got {errs:?}"
         );
         assert!(
-            bad.contains(&"t001"),
-            "expected t001 (lowercase) invalid, got {errs:?}"
+            bad.contains(&"T41"),
+            "expected T41 (truncated) invalid, got {errs:?}"
+        );
+        assert!(
+            bad.contains(&"Syntax-Error"),
+            "expected Syntax-Error (mixed case) invalid, got {errs:?}"
         );
         assert!(!bad.contains(&"T041"), "T041 must be valid");
         assert!(!bad.contains(&"L010"), "L010 must be valid");
     }
 
     #[test]
+    fn validate_accepts_named_core_codes() {
+        // The LSP layer filters on named kebab-case codes for m1-core
+        // diagnostics — these are valid in ignore/select.
+        let c = M1ToolsConfig::from_toml_str(
+            "[diagnostics]\nignore = [\"unsupported-c-token\", \"syntax-error\"]\n\
+             select = [\"missing-token\", \"annotation\", \"T080\"]\n",
+        )
+        .unwrap();
+        assert!(
+            c.validate().is_ok(),
+            "named core codes must be valid: {:?}",
+            c.validate()
+        );
+    }
+
+    #[test]
     fn validate_rejects_malformed_codes_in_select() {
         let c =
-            M1ToolsConfig::from_toml_str("[diagnostics]\nselect = [\"bad\", \"E001\"]\n").unwrap();
+            M1ToolsConfig::from_toml_str("[diagnostics]\nselect = [\"B4D\", \"E001\"]\n").unwrap();
         let errs = c.validate().unwrap_err();
         let bad: Vec<_> = errs
             .iter()
@@ -394,8 +437,19 @@ mod tests {
                 }
             })
             .collect();
-        assert!(bad.contains(&"bad"), "expected 'bad' invalid");
+        assert!(bad.contains(&"B4D"), "expected 'B4D' invalid");
         assert!(!bad.contains(&"E001"), "E001 must be valid");
+    }
+
+    #[test]
+    fn validate_rejects_zero_max_complexity() {
+        let c = M1ToolsConfig::from_toml_str("[lint]\nmax_complexity = 0\n").unwrap();
+        let errs = c.validate().unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, ConfigError::MaxComplexityZero)),
+            "expected MaxComplexityZero, got {errs:?}"
+        );
     }
 
     #[test]
