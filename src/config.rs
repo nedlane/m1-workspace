@@ -55,6 +55,10 @@ pub struct FormatSection {
 pub struct DiagnosticsSection {
     pub ignore: Option<Vec<String>>,
     pub select: Option<Vec<String>>,
+    /// Symbol-scoped suppressions for project-level diagnostics that carry no
+    /// source range (T010/T041/T050/T071/T087 …): entries of the form
+    /// `"T050:Root.Engine.Speed"` suppress that code for that one symbol only.
+    pub ignore_symbols: Option<Vec<String>>,
 }
 
 /// A validation error produced by [`M1ToolsConfig::validate`].
@@ -77,6 +81,8 @@ pub enum ConfigError {
     /// Valid codes are either tool codes matching `[A-Z][0-9]{3}` (`T041`,
     /// `L010`) or named kebab-case codes (`syntax-error`, `unsupported-c-token`).
     MalformedDiagnosticCode(String),
+    /// An entry in `[diagnostics] ignore_symbols` is not `CODE:Symbol.Path`.
+    MalformedIgnoreSymbol(String),
 }
 
 impl fmt::Display for ConfigError {
@@ -100,6 +106,10 @@ impl fmt::Display for ConfigError {
             ConfigError::MalformedDiagnosticCode(code) => write!(
                 f,
                 "malformed diagnostic code {code:?}; expected an uppercase letter + 3 digits (e.g. T041, L010) or a named code (e.g. syntax-error)"
+            ),
+            ConfigError::MalformedIgnoreSymbol(entry) => write!(
+                f,
+                "malformed ignore_symbols entry {entry:?}; expected CODE:Symbol.Path (e.g. \"T050:Root.Engine.Speed\")"
             ),
         }
     }
@@ -125,6 +135,24 @@ fn is_valid_diagnostic_code(code: &str) -> bool {
         && b.last().is_some_and(u8::is_ascii_lowercase)
         && b.iter().all(|c| c.is_ascii_lowercase() || *c == b'-');
     tool_code || named_code
+}
+
+/// Split a `[diagnostics] ignore_symbols` entry into `(code, symbol_path)`.
+/// Valid shape: a tool code (`[A-Z][0-9]{3}`), a colon, and a non-empty
+/// symbol path. Returns `None` for anything else.
+pub fn parse_ignore_symbol(entry: &str) -> Option<(&str, &str)> {
+    let (code, path) = entry.split_once(':')?;
+    let b = code.as_bytes();
+    let code_ok = b.len() == 4
+        && b[0].is_ascii_uppercase()
+        && b[1].is_ascii_digit()
+        && b[2].is_ascii_digit()
+        && b[3].is_ascii_digit();
+    if code_ok && !path.trim().is_empty() {
+        Some((code, path.trim()))
+    } else {
+        None
+    }
 }
 
 impl M1ToolsConfig {
@@ -189,6 +217,13 @@ impl M1ToolsConfig {
             && (v == 0 || v > 16)
         {
             errors.push(ConfigError::IndentWidthOutOfRange(v));
+        }
+
+        // [diagnostics] ignore_symbols: each entry must be CODE:Symbol.Path.
+        for entry in self.diagnostics.ignore_symbols.iter().flatten() {
+            if parse_ignore_symbol(entry).is_none() {
+                errors.push(ConfigError::MalformedIgnoreSymbol(entry.clone()));
+            }
         }
 
         // [diagnostics] ignore / select: each code must match [A-Z][0-9]{3}.
@@ -479,5 +514,32 @@ mod tests {
             msg2.contains("99") && msg2.contains("indent_width"),
             "{msg2:?}"
         );
+    }
+
+    #[test]
+    fn ignore_symbols_valid_entries_pass() {
+        let c = M1ToolsConfig::from_toml_str(
+            "[diagnostics]\nignore_symbols = [\"T050:Root.Engine.Speed\", \"T041:Root.X.Y\"]\n",
+        )
+        .unwrap();
+        assert!(c.validate().is_ok());
+        assert_eq!(
+            super::parse_ignore_symbol("T050:Root.Engine.Speed"),
+            Some(("T050", "Root.Engine.Speed"))
+        );
+    }
+
+    #[test]
+    fn ignore_symbols_malformed_entries_flag() {
+        let c = M1ToolsConfig::from_toml_str(
+            "[diagnostics]\nignore_symbols = [\"T050\", \"t050:Root.X\", \"T050:\"]\n",
+        )
+        .unwrap();
+        let errs = c.validate().unwrap_err();
+        let bad: Vec<_> = errs
+            .iter()
+            .filter(|e| matches!(e, ConfigError::MalformedIgnoreSymbol(_)))
+            .collect();
+        assert_eq!(bad.len(), 3, "all three malformed: {errs:?}");
     }
 }
