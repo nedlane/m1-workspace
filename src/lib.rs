@@ -17,6 +17,7 @@ pub use decode::{
 pub mod config;
 pub use config::{
     ConfigError, DiagnosticsSection, FormatSection, LintSection, M1ToolsConfig, TOOLS_CONFIG_FILE,
+    parse_ignore_symbol,
 };
 
 mod io;
