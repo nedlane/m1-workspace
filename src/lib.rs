@@ -16,7 +16,7 @@ pub use decode::{
 
 pub mod config;
 pub use config::{
-    DiagnosticsSection, FormatSection, LintSection, M1ToolsConfig, TOOLS_CONFIG_FILE,
+    ConfigError, DiagnosticsSection, FormatSection, LintSection, M1ToolsConfig, TOOLS_CONFIG_FILE,
 };
 
 mod io;
@@ -81,6 +81,17 @@ pub fn find_config_file(start: &Path) -> Option<PathBuf> {
 pub fn find_dbc_files(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     walk_ext(root, DBC_EXT, &mut out);
+    out.sort();
+    out
+}
+
+/// All `*.m1scr` files under `root`, searched recursively. Sorted for
+/// deterministic order. Symlinked directories are not descended (same guard as
+/// [`find_dbc_files`]). Real `.m1scr` filenames often contain spaces
+/// (e.g. `"Torque Vectoring.m1scr"`); those are returned as-is.
+pub fn find_scripts(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    walk_ext(root, SCRIPT_EXT, &mut out);
     out.sort();
     out
 }
@@ -245,5 +256,98 @@ mod tests {
         assert_eq!(qualify_root("Root"), "Root");
         assert_eq!(strip_root("Root.Foo.Bar"), "Foo.Bar");
         assert_eq!(strip_root("Foo.Bar"), "Foo.Bar");
+    }
+
+    // ── Issue #16: find_scripts() ────────────────────────────────────────────
+
+    #[test]
+    fn find_scripts_finds_nested_scripts_sorted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let sub = root.join("Scripts");
+        fs::create_dir_all(&sub).unwrap();
+        // Scripts in a subdirectory, deliberately out of order.
+        fs::write(sub.join("Beta.m1scr"), "").unwrap();
+        fs::write(sub.join("Alpha.m1scr"), "").unwrap();
+        // Script at root level.
+        fs::write(root.join("Top.m1scr"), "").unwrap();
+        // Non-script file should be excluded.
+        fs::write(sub.join("notes.txt"), "").unwrap();
+        let found = find_scripts(root);
+        // All .m1scr files, sorted.
+        let mut expected = vec![
+            sub.join("Alpha.m1scr"),
+            sub.join("Beta.m1scr"),
+            root.join("Top.m1scr"),
+        ];
+        expected.sort();
+        assert_eq!(found, expected);
+    }
+
+    #[test]
+    fn find_scripts_includes_filenames_with_spaces() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let sub = root.join("UQR-EV").join("01.00").join("Scripts");
+        fs::create_dir_all(&sub).unwrap();
+        // Real .m1scr filenames contain spaces (e.g. "Torque Vectoring.m1scr").
+        fs::write(sub.join("Torque Vectoring.m1scr"), "").unwrap();
+        fs::write(sub.join("Motor Control.m1scr"), "").unwrap();
+        let found = find_scripts(root);
+        let mut expected = vec![
+            sub.join("Motor Control.m1scr"),
+            sub.join("Torque Vectoring.m1scr"),
+        ];
+        expected.sort();
+        assert_eq!(found, expected);
+    }
+
+    #[test]
+    fn find_scripts_excludes_non_script_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("data.m1dbc"), "").unwrap();
+        fs::write(root.join("params.m1cfg"), "").unwrap();
+        fs::write(root.join("Project.m1prj"), "").unwrap();
+        fs::write(root.join("readme.txt"), "").unwrap();
+        let found = find_scripts(root);
+        assert!(found.is_empty(), "expected no scripts, got {found:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_scripts_skips_symlinked_dirs() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("proj");
+        let inside = root.join("Scripts");
+        fs::create_dir_all(&inside).unwrap();
+        fs::write(inside.join("Real.m1scr"), "").unwrap();
+        // Out-of-tree directory with a .m1scr file.
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("Leaked.m1scr"), "").unwrap();
+        // Symlink inside the project pointing outside.
+        symlink(&outside, root.join("escape")).unwrap();
+        let found = find_scripts(&root);
+        // Only the in-tree script is found; the symlinked dir is skipped.
+        assert_eq!(found, vec![inside.join("Real.m1scr")]);
+    }
+
+    #[test]
+    fn find_scripts_ordering_is_deterministic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let names = ["Zebra.m1scr", "Alpha.m1scr", "Middle.m1scr"];
+        for n in &names {
+            fs::write(root.join(n), "").unwrap();
+        }
+        let first = find_scripts(root);
+        let second = find_scripts(root);
+        assert_eq!(first, second, "find_scripts must be deterministic");
+        // Must be sorted.
+        let mut sorted = first.clone();
+        sorted.sort();
+        assert_eq!(first, sorted, "find_scripts must return sorted paths");
     }
 }
