@@ -20,6 +20,7 @@ pub use config::{
     parse_ignore_symbol,
 };
 
+pub mod diff;
 mod io;
 pub use io::atomic_write;
 
