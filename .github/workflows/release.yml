@@ -36,10 +36,30 @@ jobs:
             exit 0
           fi
           echo "Creating $TAG (tag + release) at $GITHUB_SHA"
+          # Body: auto-generated "What's Changed" (PR list + full changelog
+          # link) followed by a consume/install snippet. PR titles may contain
+          # backticks, so the generated half never passes through an unquoted
+          # heredoc; the static half is a quoted heredoc with placeholders
+          # substituted afterwards.
+          gh api "repos/$GITHUB_REPOSITORY/releases/generate-notes" \
+            -f tag_name="$TAG" -f target_commitish="$GITHUB_SHA" \
+            -q .body > body.md || echo "_Generated notes unavailable._" > body.md
+          cat >> body.md <<'NOTES'
+
+          ## Consume
+
+          Source-only release — the git tag is the deliverable; Cargo builds it from source:
+
+          ```toml
+          [dependencies]
+          m1-workspace = { git = "https://github.com/{{REPO}}", tag = "{{TAG}}" }
+          ```
+          NOTES
+          sed -i "s|{{REPO}}|$GITHUB_REPOSITORY|g; s|{{TAG}}|$TAG|g" body.md
           # If the tag already exists, gh attaches the release to it; otherwise
           # it creates the tag at the current commit.
           gh release create "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
             --title "m1-workspace $TAG" \
-            --generate-notes
+            --notes-file body.md
