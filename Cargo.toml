@@ -2,6 +2,7 @@
 name = "m1-workspace"
 version = "0.8.1"
 edition = "2024"
+rust-version = "1.88"
 license = "GPL-3.0-or-later"
 description = "Shared filesystem and path conventions for the MoTeC M1 toolchain"
 repository = "https://github.com/nedlane/m1-workspace"
