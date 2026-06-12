@@ -47,6 +47,13 @@ pub struct FormatSection {
     pub indent_width: Option<usize>,
     /// `"allman"` | `"kr"`.
     pub brace_style: Option<String>,
+    /// Extra indent levels for wrapped continuation lines (m1-fmt
+    /// `continuation_indent`). Range-checked like `indent_width`.
+    pub continuation_indent: Option<usize>,
+    /// Align consecutive `=` assignments into a column (m1-fmt #96).
+    pub align_assignments: Option<bool>,
+    /// Re-wrap block and line comments to the line width (m1-fmt #95).
+    pub reflow_comments: Option<bool>,
 }
 
 /// `[diagnostics]` — cross-tool code filter (L-codes and T-codes).
@@ -70,6 +77,8 @@ pub enum ConfigError {
     MaxLineLengthOutOfRange(usize),
     /// `[format] indent_width` must be ≥ 1 and ≤ 16.
     IndentWidthOutOfRange(usize),
+    /// `[format] continuation_indent` must be ≥ 1 and ≤ 16.
+    ContinuationIndentOutOfRange(usize),
     /// `[lint] max_nesting_depth` must be ≥ 1.
     MaxNestingDepthZero,
     /// `[lint] max_cognitive_complexity` must be ≥ 1.
@@ -93,6 +102,9 @@ impl fmt::Display for ConfigError {
             }
             ConfigError::IndentWidthOutOfRange(v) => {
                 write!(f, "indent_width must be ≥ 1 and ≤ 16; got {v}")
+            }
+            ConfigError::ContinuationIndentOutOfRange(v) => {
+                write!(f, "continuation_indent must be ≥ 1 and ≤ 16; got {v}")
             }
             ConfigError::MaxNestingDepthZero => {
                 write!(f, "max_nesting_depth must be ≥ 1; got 0")
@@ -217,6 +229,13 @@ impl M1ToolsConfig {
             && (v == 0 || v > 16)
         {
             errors.push(ConfigError::IndentWidthOutOfRange(v));
+        }
+
+        // [format] continuation_indent: same 1..=16 range as indent_width (#25).
+        if let Some(v) = self.format.continuation_indent
+            && (v == 0 || v > 16)
+        {
+            errors.push(ConfigError::ContinuationIndentOutOfRange(v));
         }
 
         // [diagnostics] ignore_symbols: each entry must be CODE:Symbol.Path.
@@ -374,6 +393,36 @@ mod tests {
                 .any(|e| matches!(e, ConfigError::IndentWidthOutOfRange(17))),
             "expected IndentWidthOutOfRange(17), got {errs:?}"
         );
+    }
+
+    #[test]
+    fn parses_format_continuation_and_comment_knobs() {
+        // #25: the unified [format] section can now express the m1-fmt knobs that
+        // previously needed a .m1fmt.toml side file.
+        let c = M1ToolsConfig::from_toml_str(
+            "[format]\ncontinuation_indent = 2\nalign_assignments = true\nreflow_comments = false\n",
+        )
+        .unwrap();
+        assert_eq!(c.format.continuation_indent, Some(2));
+        assert_eq!(c.format.align_assignments, Some(true));
+        assert_eq!(c.format.reflow_comments, Some(false));
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_out_of_range_continuation_indent() {
+        for bad in [0usize, 17] {
+            let c =
+                M1ToolsConfig::from_toml_str(&format!("[format]\ncontinuation_indent = {bad}\n"))
+                    .unwrap();
+            let errs = c.validate().unwrap_err();
+            assert!(
+                errs.iter().any(
+                    |e| matches!(e, ConfigError::ContinuationIndentOutOfRange(v) if *v == bad)
+                ),
+                "expected ContinuationIndentOutOfRange({bad}), got {errs:?}"
+            );
+        }
     }
 
     #[test]
