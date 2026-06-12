@@ -16,8 +16,8 @@ pub use decode::{
 
 pub mod config;
 pub use config::{
-    ConfigError, DiagnosticsSection, FormatSection, LintSection, M1ToolsConfig, TOOLS_CONFIG_FILE,
-    parse_ignore_symbol,
+    ConfigError, DiagnosticsSection, DiscoverError, DiscoveredConfig, FormatSection, LintSection,
+    M1ToolsConfig, TOOLS_CONFIG_FILE, parse_ignore_symbol,
 };
 
 pub mod diff;
@@ -25,7 +25,7 @@ mod io;
 pub use io::atomic_write;
 
 mod line_index;
-pub use line_index::LineIndex;
+pub use line_index::{LineIndex, PositionEncoding};
 
 mod style;
 pub use style::{BraceStyle, IndentStyle, InvalidStyle};
