@@ -54,6 +54,9 @@ pub struct FormatSection {
     pub align_assignments: Option<bool>,
     /// Re-wrap block and line comments to the line width (m1-fmt #95).
     pub reflow_comments: Option<bool>,
+    /// End the file with one blank line instead of a bare newline — the
+    /// formatter pair of m1-lint L027 (m1-fmt #116).
+    pub final_blank_line: Option<bool>,
 }
 
 /// `[diagnostics]` — cross-tool code filter (L-codes and T-codes).
@@ -385,7 +388,7 @@ mod tests {
              max_complexity = 10\nmax_cognitive_complexity = 20\nexclude = []\n\
              [format]\nline_width = 100\nmax_blank_lines = 2\nindent_style = \"tab\"\n\
              indent_width = 4\nbrace_style = \"allman\"\ncontinuation_indent = 1\n\
-             align_assignments = false\nreflow_comments = false\n\
+             align_assignments = false\nreflow_comments = false\nfinal_blank_line = false\n\
              [diagnostics]\nignore = []\nselect = []\nignore_symbols = []\n";
         let (_, unknown) = M1ToolsConfig::from_toml_str_with_unknown_keys(toml).unwrap();
         assert_eq!(unknown, Vec::<String>::new());
