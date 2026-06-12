@@ -51,6 +51,78 @@ impl LineIndex {
     pub fn line_start(&self, line: usize) -> Option<usize> {
         self.starts.get(line).copied()
     }
+
+    /// 0-based `(line, column)` of byte offset `pos`, with the column counted
+    /// in `enc` code units (the LSP position encodings). `text` must be the
+    /// same string this index was built from — the index stores only line
+    /// starts, so the caller supplies the text for the column scan.
+    ///
+    /// `pos` is clamped to `text.len()` and rounded **down** to a UTF-8 char
+    /// boundary: a diagnostic byte range can end mid-codepoint (e.g. an
+    /// unterminated string/comment containing `é`/`°`/an emoji), and slicing
+    /// at a non-boundary would panic — in an LSP that panic propagates out of
+    /// the publish future and aborts the whole server (m1-lsp #132). Line
+    /// starts always follow `\n`, so only the upper bound needs flooring.
+    pub fn position_in(&self, text: &str, pos: usize, enc: PositionEncoding) -> (usize, usize) {
+        let mut pos = pos.min(text.len());
+        while pos > 0 && !text.is_char_boundary(pos) {
+            pos -= 1;
+        }
+        let line = self.line_at(pos);
+        let slice = &text[self.starts[line]..pos];
+        let col = match enc {
+            PositionEncoding::Utf8 => slice.len(),
+            PositionEncoding::Utf16 => slice.chars().map(char::len_utf16).sum(),
+        };
+        (line, col)
+    }
+
+    /// Byte offset of 0-based `(line, column)` in `text`, with the column
+    /// counted in `enc` code units — the inverse of [`Self::position_in`].
+    /// `text` must be the same string this index was built from.
+    ///
+    /// Out-of-range positions clamp: a line past the end maps to `text.len()`,
+    /// and a column past the end of its line (or landing inside a code point)
+    /// stops at the last boundary that fits, never beyond the line.
+    pub fn offset_in(
+        &self,
+        text: &str,
+        line: usize,
+        column: usize,
+        enc: PositionEncoding,
+    ) -> usize {
+        let Some(&line_start) = self.starts.get(line) else {
+            return text.len();
+        };
+        let line_end = self.starts.get(line + 1).copied().unwrap_or(text.len());
+        let mut remaining = column;
+        let mut off = line_start;
+        for c in text[line_start..line_end].chars() {
+            if remaining == 0 {
+                break;
+            }
+            let units = match enc {
+                PositionEncoding::Utf8 => c.len_utf8(),
+                PositionEncoding::Utf16 => c.len_utf16(),
+            };
+            if units > remaining {
+                break;
+            }
+            remaining -= units;
+            off += c.len_utf8();
+        }
+        off
+    }
+}
+
+/// Code-unit encoding for [`LineIndex::position_in`] / [`LineIndex::offset_in`]
+/// columns — the two position encodings an LSP client can negotiate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PositionEncoding {
+    /// Columns in UTF-8 bytes.
+    Utf8,
+    /// Columns in UTF-16 code units (the LSP default).
+    Utf16,
 }
 
 #[cfg(test)]
@@ -99,5 +171,71 @@ mod tests {
         assert_eq!(idx.line_at(0), 0);
         // Offset past the final newline maps to the (empty) trailing line.
         assert_eq!(idx.line_at(2), 1);
+    }
+
+    // The encoding-aware conversions below were hoisted from m1-lsp's local
+    // LineIndex copy (m1-lsp #265); their tests moved upstream with the code.
+
+    #[test]
+    fn position_in_ascii() {
+        let s = "ab\ncde\n";
+        let li = LineIndex::new(s);
+        // 'a'@0 -> 0:0 ; 'c'@3 -> 1:0 ; 'e'@5 -> 1:2 ; end@7 -> 2:0
+        assert_eq!(li.position_in(s, 0, PositionEncoding::Utf16), (0, 0));
+        assert_eq!(li.position_in(s, 3, PositionEncoding::Utf16), (1, 0));
+        assert_eq!(li.position_in(s, 5, PositionEncoding::Utf16), (1, 2));
+        assert_eq!(li.position_in(s, 7, PositionEncoding::Utf16), (2, 0));
+    }
+
+    #[test]
+    fn position_in_utf16_counts_code_units_not_bytes() {
+        // "é" is 2 bytes in UTF-8, 1 UTF-16 code unit. "𝄞" is 4 bytes, 2 units.
+        let s = "é𝄞x"; // bytes: 2 + 4 + 1 = 7
+        let li = LineIndex::new(s);
+        // byte 7 (end) -> column 1(é)+2(𝄞)+1(x) = 4 UTF-16 units
+        assert_eq!(li.position_in(s, 7, PositionEncoding::Utf16), (0, 4));
+        // same byte in UTF-8 encoding counts bytes -> column 7
+        assert_eq!(li.position_in(s, 7, PositionEncoding::Utf8), (0, 7));
+    }
+
+    #[test]
+    fn offset_in_round_trips() {
+        let s = "ab\né𝄞x\n";
+        let li = LineIndex::new(s);
+        for enc in [PositionEncoding::Utf16, PositionEncoding::Utf8] {
+            for b in [0usize, 1, 3, 5, 9, s.len()] {
+                if !s.is_char_boundary(b) {
+                    continue;
+                }
+                let (line, col) = li.position_in(s, b, enc);
+                assert_eq!(li.offset_in(s, line, col, enc), b, "byte {b} via {enc:?}");
+            }
+        }
+        // A line past the end clamps to text.len().
+        assert_eq!(li.offset_in(s, 99, 0, PositionEncoding::Utf16), s.len());
+    }
+
+    #[test]
+    fn position_in_empty_document() {
+        let li = LineIndex::new("");
+        assert_eq!(li.position_in("", 0, PositionEncoding::Utf16), (0, 0));
+    }
+
+    #[test]
+    fn position_in_mid_codepoint_byte_does_not_panic() {
+        // m1-lsp #132: a diagnostic byte range can end inside a multibyte char
+        // (e.g. an unterminated comment containing `𝄞`). `position_in` must
+        // clamp to a char boundary instead of panicking.
+        let s = "/* é 𝄞"; // '𝄞' occupies bytes 6..10
+        let li = LineIndex::new(s);
+        // Byte 7 is inside the 4-byte '𝄞' — must behave like byte 6, not panic.
+        assert_eq!(
+            li.position_in(s, 7, PositionEncoding::Utf16),
+            li.position_in(s, 6, PositionEncoding::Utf16)
+        );
+        assert_eq!(li.position_in(s, 7, PositionEncoding::Utf16), (0, 5));
+        // Past-end offsets must also be safe.
+        let _ = li.position_in(s, s.len(), PositionEncoding::Utf16);
+        let _ = li.position_in(s, 9999, PositionEncoding::Utf8);
     }
 }

@@ -10,7 +10,7 @@
 
 use serde::Deserialize;
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// The unified config file name, discovered by walking up from a working dir.
 pub const TOOLS_CONFIG_FILE: &str = "m1-tools.toml";
@@ -167,20 +167,116 @@ pub fn parse_ignore_symbol(entry: &str) -> Option<(&str, &str)> {
     }
 }
 
+/// Why [`M1ToolsConfig::discover_result`] could not load an existing
+/// `m1-tools.toml`. "No file found" is not an error — that is `Ok(None)`.
+#[derive(Debug)]
+pub enum DiscoverError {
+    /// The file exists but could not be read.
+    Read {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    /// The file was read but is not valid TOML / does not match the schema.
+    Parse {
+        path: PathBuf,
+        source: toml::de::Error,
+    },
+}
+
+impl fmt::Display for DiscoverError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DiscoverError::Read { path, source } => {
+                write!(f, "cannot read {}: {source}", path.display())
+            }
+            DiscoverError::Parse { path, source } => {
+                write!(f, "cannot parse {}: {source}", path.display())
+            }
+        }
+    }
+}
+
+impl std::error::Error for DiscoverError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            DiscoverError::Read { source, .. } => Some(source),
+            DiscoverError::Parse { source, .. } => Some(source),
+        }
+    }
+}
+
+/// A successfully discovered and parsed `m1-tools.toml`, with everything a
+/// tool needs to surface config diagnostics to the user.
+#[derive(Debug)]
+pub struct DiscoveredConfig {
+    /// Where the file was found.
+    pub path: PathBuf,
+    pub config: M1ToolsConfig,
+    /// Dotted paths of keys present in the file but unknown to the schema
+    /// (e.g. `format.line_wdith` for a typo) — empty when the file is clean.
+    /// Worth warning about: an unknown key silently keeps the tool default.
+    pub unknown_keys: Vec<String>,
+}
+
 impl M1ToolsConfig {
-    /// Parse a `m1-tools.toml` body. Unknown keys are ignored (serde `default`).
+    /// Parse a `m1-tools.toml` body. Unknown keys are ignored (serde `default`);
+    /// use [`Self::from_toml_str_with_unknown_keys`] to report them.
     pub fn from_toml_str(s: &str) -> Result<Self, toml::de::Error> {
         toml::from_str(s)
     }
 
+    /// Parse a `m1-tools.toml` body and also collect the dotted paths of any
+    /// keys the schema does not know (`format.line_wdith`, `lnit`, …), so a
+    /// CLI/LSP can warn that a typo is silently falling back to the default.
+    /// The parse itself stays as permissive as [`Self::from_toml_str`].
+    pub fn from_toml_str_with_unknown_keys(
+        s: &str,
+    ) -> Result<(Self, Vec<String>), toml::de::Error> {
+        let de = toml::de::Deserializer::parse(s)?;
+        let mut unknown = Vec::new();
+        let config = serde_ignored::deserialize(de, |path| unknown.push(path.to_string()))?;
+        Ok((config, unknown))
+    }
+
     /// Walk up from `start` (inclusive) for `m1-tools.toml` and return the parsed
     /// config of the first one found. `None` if none is found OR the file fails to
-    /// parse — the lenient path the CLIs use so a malformed unified file never
-    /// aborts a run (callers wanting hard errors use [`Self::from_toml_str`]).
+    /// parse — the lenient path for callers that must never abort on a malformed
+    /// unified file. Consumers that can surface diagnostics should prefer
+    /// [`Self::discover_result`], which distinguishes "no config" from "broken
+    /// config" and reports unknown keys.
     pub fn discover(start: &Path) -> Option<Self> {
-        let path = crate::find_upward(start, TOOLS_CONFIG_FILE)?;
-        let text = std::fs::read_to_string(&path).ok()?;
-        Self::from_toml_str(&text).ok()
+        Self::discover_result(start)
+            .ok()
+            .flatten()
+            .map(|found| found.config)
+    }
+
+    /// Strict variant of [`Self::discover`]: walk up from `start` (inclusive)
+    /// for `m1-tools.toml`. Returns `Ok(None)` when no file exists, and a
+    /// [`DiscoverError`] when a file exists but cannot be read or parsed — so
+    /// a malformed config surfaces as an error instead of being silently
+    /// ignored. On success the [`DiscoveredConfig`] also carries any unknown
+    /// keys for typo warnings.
+    pub fn discover_result(start: &Path) -> Result<Option<DiscoveredConfig>, DiscoverError> {
+        let Some(path) = crate::find_upward(start, TOOLS_CONFIG_FILE) else {
+            return Ok(None);
+        };
+        let text = std::fs::read_to_string(&path).map_err(|source| DiscoverError::Read {
+            path: path.clone(),
+            source,
+        })?;
+        let (config, unknown_keys) =
+            Self::from_toml_str_with_unknown_keys(&text).map_err(|source| {
+                DiscoverError::Parse {
+                    path: path.clone(),
+                    source,
+                }
+            })?;
+        Ok(Some(DiscoveredConfig {
+            path,
+            config,
+            unknown_keys,
+        }))
     }
 
     /// Validate the configuration values, returning all errors collected.
@@ -269,6 +365,61 @@ impl M1ToolsConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_keys_are_reported_with_dotted_paths() {
+        let (c, unknown) = M1ToolsConfig::from_toml_str_with_unknown_keys(
+            "[format]\nline_wdith = 100\nindent_width = 4\n\
+             [lnit]\nmax_line_length = 80\n",
+        )
+        .unwrap();
+        // The typo'd key is ignored (default kept), but reported.
+        assert_eq!(c.format.line_width, None);
+        assert_eq!(c.format.indent_width, Some(4));
+        assert_eq!(unknown, vec!["format.line_wdith", "lnit"]);
+    }
+
+    #[test]
+    fn clean_config_reports_no_unknown_keys() {
+        let toml = "[lint]\nmax_line_length = 100\nmax_nesting_depth = 4\n\
+             max_complexity = 10\nmax_cognitive_complexity = 20\nexclude = []\n\
+             [format]\nline_width = 100\nmax_blank_lines = 2\nindent_style = \"tab\"\n\
+             indent_width = 4\nbrace_style = \"allman\"\ncontinuation_indent = 1\n\
+             align_assignments = false\nreflow_comments = false\n\
+             [diagnostics]\nignore = []\nselect = []\nignore_symbols = []\n";
+        let (_, unknown) = M1ToolsConfig::from_toml_str_with_unknown_keys(toml).unwrap();
+        assert_eq!(unknown, Vec::<String>::new());
+    }
+
+    #[test]
+    fn discover_result_distinguishes_missing_from_malformed() {
+        let dir = std::env::temp_dir().join(format!("m1ws-cfg-{}", std::process::id()));
+        let sub = dir.join("nested");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        // No file anywhere up the tree we created -> Ok(None) from `dir` only
+        // if no ancestor has one; instead assert the *found* cases, which are
+        // hermetic to this temp tree.
+        let cfg_path = dir.join(TOOLS_CONFIG_FILE);
+
+        // Malformed file -> Err(Parse), not a silent default.
+        std::fs::write(&cfg_path, "[format\nindent_width = 4\n").unwrap();
+        match M1ToolsConfig::discover_result(&sub) {
+            Err(DiscoverError::Parse { path, .. }) => assert_eq!(path, cfg_path),
+            other => panic!("expected Parse error, got {other:?}"),
+        }
+        // ...while the lenient path stays lenient.
+        assert!(M1ToolsConfig::discover(&sub).is_none());
+
+        // Valid file -> found, parsed, unknown keys reported.
+        std::fs::write(&cfg_path, "[format]\nindent_width = 2\nline_wdith = 9\n").unwrap();
+        let found = M1ToolsConfig::discover_result(&sub).unwrap().unwrap();
+        assert_eq!(found.path, cfg_path);
+        assert_eq!(found.config.format.indent_width, Some(2));
+        assert_eq!(found.unknown_keys, vec!["format.line_wdith"]);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn parses_all_sections() {
