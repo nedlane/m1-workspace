@@ -2,33 +2,43 @@
 
 Guidance for coding agents working in this repository.
 
-## What this is
+## Purpose
 
-The shared base crate of the M1 toolchain: project/file discovery, path
-conventions, tolerant Windows-1252/UTF-8 text decoding, the unified
-`m1-tools.toml` config schema, atomic writes, unified diff, `LineIndex`, and
-the shared `IndentStyle`/`BraceStyle` enums. It is a **leaf crate**: it must
-not depend on any other m1-* crate, and (almost) everything in the toolchain
-depends on it.
+The shared base crate of the M1 toolchain. Every tool that loads a MoTeC M1
+project (`m1-fmt`, `m1-lint`, `m1-typecheck`, `m1-lsp`, `m1-project`) needs to
+find the same files, decode them the same way, and read the same
+configuration. This crate exists so those rules live in exactly one place —
+before it, the discovery and decoding logic was duplicated across tools and
+drifted.
 
-## Module map
+It covers four areas: project/file discovery and path conventions, tolerant
+text decoding, the unified `m1-tools.toml` config schema, and small shared
+output/style primitives (atomic writes, diffs, line indexing, indent/brace
+style enums).
 
-- `src/lib.rs` — discovery (`find_project_file`, `find_config_file`,
-  `find_dbc_files`, `find_scripts`, `find_upward`) and the `Root.` prefix
-  helpers (`qualify_root`/`strip_root`) plus file-name constants.
-- `src/decode.rs` — tolerant text reading. MoTeC files are Windows-1252 in
-  practice; a strict UTF-8 read of a real project will fail. Never replace
-  these readers with `fs::read_to_string`.
-- `src/config.rs` — the `m1-tools.toml` schema (`M1ToolsConfig` with
-  `[format]`/`[lint]`/`[diagnostics]`), `validate()` range checks,
-  `parse_ignore_symbol`. New knobs are `Option<T>` defaulting to `None`
-  (additive ⇒ minor version bump) and get a `validate()` range check + tests
-  when numeric.
-- `src/io.rs` — `atomic_write` (temp file + rename in the target directory).
-- `src/diff.rs` — `unified_diff`, shared by `m1-fmt --diff` and m1-lsp.
-- `src/line_index.rs` — byte offset ↔ line/column.
-- `src/style.rs` — `IndentStyle`, `BraceStyle` (manual-conformant defaults are
-  tabs + Allman; the enums themselves are neutral).
+## Things that are deliberate (don't "fix" them)
+
+- **Leaf crate.** It must not depend on any other m1-* crate — everything else
+  depends on it. Keep third-party dependencies minimal too.
+- **Tolerant decoding is the point.** Real MoTeC files are Windows-1252 in
+  practice, not UTF-8; a strict `fs::read_to_string` on a real project fails.
+  Don't replace the decode helpers with strict reads.
+- **Config knobs are `Option<T>` defaulting to `None`.** Defaults belong to
+  the consuming tools, and additive optional fields keep schema changes to a
+  minor version bump.
+- **Manual-conformant defaults.** Where the M1 Development Manual mandates a
+  style (tabs, Allman braces), the toolchain defaults to the manual and makes
+  deviation a config choice — never the other way around.
+
+## How it's consumed and released
+
+Consumed via **versioned git tags** (`tag = "vX.Y.Z"`), never `branch`/`path`/
+`[patch]` deps — the local multi-repo checkout must build exactly like a
+public clone. A release is a version bump on `main`; `release.yml` creates the
+tag, and the tag is the deliverable. After releasing, open the consumer bump
+PRs immediately rather than waiting for Dependabot. Schema additions here
+usually cascade: consumers wire new config fields through their own resolve
+layers in follow-up PRs.
 
 ## Build / test gate
 
@@ -38,28 +48,6 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-CI also runs a Docs job (rustdoc with `-D warnings`), a Security Audit, and an
-MSRV job pinned to Rust 1.88. The MSRV pin in `.github/workflows/ci.yml`
-(`dtolnay/rust-toolchain@1.88`) must stay in sync with `rust-version` in
-`Cargo.toml` — never bump one without the other (Dependabot is configured to
-ignore that action for this reason).
-
-## Releases and consumers
-
-- Consumed via **versioned git tags** (`tag = "vX.Y.Z"`), never `branch` or
-  `path`/`[patch]` deps — the local multi-repo checkout must build exactly like
-  a public clone.
-- Release = bump `version` in `Cargo.toml` (and `Cargo.lock`) on `main`;
-  `release.yml` creates the tag. The tag is the deliverable.
-- After a release, open the consumer bump PRs (m1-fmt, m1-lint, m1-typecheck,
-  m1-lsp, m1-project) immediately — Dependabot's daily run is the backstop,
-  not the propagation path.
-- Schema changes here usually cascade: consumer crates wire new config fields
-  through their own resolve layers in follow-up PRs.
-
-## Conventions
-
-- Commit messages: conventional (`feat:`, `fix:`, `chore:`, `docs:`).
-- No AI attribution or `Co-Authored-By` trailers in commits or PRs.
-- Keep this crate dependency-light (currently serde + toml only); think hard
-  before adding anything.
+CI also runs rustdoc with `-D warnings`, a security audit, and an MSRV job.
+The MSRV pin in CI (`dtolnay/rust-toolchain@<version>`) must stay in sync with
+`rust-version` in `Cargo.toml` — never bump one without the other.
