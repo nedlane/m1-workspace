@@ -36,7 +36,7 @@ scheme the rest of the toolchain uses). Pin the
 
 ```toml
 [dependencies]
-m1-workspace = { git = "https://github.com/nedlane/m1-workspace.git", tag = "v0.9.0" }
+m1-workspace = { git = "https://github.com/nedlane/m1-workspace.git", tag = "v0.10.0" }
 ```
 
 ```rust
