@@ -46,11 +46,19 @@ pub const ROOT_PREFIX: &str = "Root.";
 
 /// Walk up from `start` (inclusive) through ancestor directories, returning the
 /// first directory that contains a file named `file_name`.
+///
+/// Symlinks are skipped: `symlink_metadata` is used so that a symlink whose
+/// name matches `file_name` is never treated as a real project/config file,
+/// even if the target exists. This mirrors the guard in [`walk_ext`] that
+/// prevents symlinks from diverting tree-walk discovery out of the project
+/// (m1-workspace#7).
 pub fn find_upward(start: &Path, file_name: &str) -> Option<PathBuf> {
     let mut dir = Some(start);
     while let Some(d) = dir {
         let cand = d.join(file_name);
-        if cand.is_file() {
+        if let Ok(meta) = cand.symlink_metadata()
+            && meta.file_type().is_file()
+        {
             return Some(cand);
         }
         dir = d.parent();
@@ -241,6 +249,32 @@ mod tests {
         // Only the in-tree dbc is found; the `escape` symlink is not followed.
         let found = find_dbc_files(&root);
         assert_eq!(found, vec![inside.join("in.m1dbc")]);
+    }
+
+    /// find_upward must NOT follow a symlink named `Project.m1prj` that points
+    /// to a file outside the project tree (mirrors the walk_ext guard; see
+    /// m1-workspace#7 and commit 35080eb).
+    #[cfg(unix)]
+    #[test]
+    fn find_upward_skips_symlink_to_out_of_tree_file() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        // Ancestor dir that holds only a symlink named Project.m1prj.
+        let ancestor = tmp.path().join("ancestor");
+        fs::create_dir_all(&ancestor).unwrap();
+        // The real file lives outside the tree.
+        let outside = tmp.path().join("real_project.m1prj");
+        fs::write(&outside, "<x/>").unwrap();
+        // Symlink: ancestor/Project.m1prj -> ../../real_project.m1prj
+        symlink(&outside, ancestor.join(PROJECT_FILE)).unwrap();
+        // Start search from a child of ancestor.
+        let start = ancestor.join("subdir");
+        fs::create_dir_all(&start).unwrap();
+        // find_upward must not return the symlink as a valid project file.
+        assert!(
+            find_project_file(&start).is_none(),
+            "find_upward must not follow a symlink named {PROJECT_FILE}"
+        );
     }
 
     #[test]
