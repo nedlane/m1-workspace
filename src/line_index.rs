@@ -94,7 +94,16 @@ impl LineIndex {
         let Some(&line_start) = self.starts.get(line) else {
             return text.len();
         };
-        let line_end = self.starts.get(line + 1).copied().unwrap_or(text.len());
+        // The next line-start sits one byte *after* this line's trailing `\n`;
+        // exclude that newline so an out-of-range column clamps to end-of-line
+        // rather than crossing into the next line (LSP spec §3.16.1, issue #33).
+        // The last line has no next start (and no trailing `\n`), so it ends at
+        // `text.len()`.
+        let line_end = self
+            .starts
+            .get(line + 1)
+            .map(|&next| next.saturating_sub(1).min(text.len()))
+            .unwrap_or(text.len());
         let mut remaining = column;
         let mut off = line_start;
         for c in text[line_start..line_end].chars() {
@@ -219,6 +228,35 @@ mod tests {
     fn position_in_empty_document() {
         let li = LineIndex::new("");
         assert_eq!(li.position_in("", 0, PositionEncoding::Utf16), (0, 0));
+    }
+
+    #[test]
+    fn offset_in_out_of_range_column_clamps_to_end_of_line_not_next_line() {
+        // Issue #33: an out-of-range column must clamp to end-of-line, not cross
+        // the trailing `\n` into the next line (LSP spec §3.16.1). Previously
+        // `line_end` included the newline, so a huge column consumed the `\n`
+        // and `position_in` reported the *next* line.
+        let s = "x\nsome other content";
+        let li = LineIndex::new(s);
+        // Column 100 on line 0 is way past the single 'x'; it must land at the
+        // end of line 0 (byte 1, just before the '\n'), NOT byte 2 (line 1).
+        let off = li.offset_in(s, 0, 100, PositionEncoding::Utf16);
+        assert_eq!(off, 1, "out-of-range column must stop before the newline");
+        // And the round-trip back must stay on line 0.
+        assert_eq!(li.position_in(s, off, PositionEncoding::Utf16).0, 0);
+
+        // Same for UTF-8 columns, and for a middle line with a real EOL.
+        let off8 = li.offset_in(s, 0, 100, PositionEncoding::Utf8);
+        assert_eq!(off8, 1);
+        assert_eq!(li.position_in(s, off8, PositionEncoding::Utf8).0, 0);
+
+        // Multi-line: an out-of-range column on a non-last line stops at that
+        // line's EOL, never on the following line.
+        let m = "ab\ncd\nef";
+        let mi = LineIndex::new(m);
+        let line1_eol = mi.offset_in(m, 1, 50, PositionEncoding::Utf16);
+        assert_eq!(line1_eol, 5, "line 1 ends at byte 5 (before its '\\n')");
+        assert_eq!(mi.position_in(m, line1_eol, PositionEncoding::Utf16).0, 1);
     }
 
     #[test]

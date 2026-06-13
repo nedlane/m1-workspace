@@ -78,6 +78,8 @@ pub struct DiagnosticsSection {
 pub enum ConfigError {
     /// `[lint] max_line_length` must be ≥ 1 and ≤ 1000.
     MaxLineLengthOutOfRange(usize),
+    /// `[format] line_width` must be ≥ 1 and ≤ 1000.
+    LineWidthOutOfRange(usize),
     /// `[format] indent_width` must be ≥ 1 and ≤ 16.
     IndentWidthOutOfRange(usize),
     /// `[format] continuation_indent` must be ≥ 1 and ≤ 16.
@@ -102,6 +104,9 @@ impl fmt::Display for ConfigError {
         match self {
             ConfigError::MaxLineLengthOutOfRange(v) => {
                 write!(f, "max_line_length must be ≥ 1 and ≤ 1000; got {v}")
+            }
+            ConfigError::LineWidthOutOfRange(v) => {
+                write!(f, "line_width must be ≥ 1 and ≤ 1000; got {v}")
             }
             ConfigError::IndentWidthOutOfRange(v) => {
                 write!(f, "indent_width must be ≥ 1 and ≤ 16; got {v}")
@@ -323,6 +328,15 @@ impl M1ToolsConfig {
             errors.push(ConfigError::MaxComplexityZero);
         }
 
+        // [format] line_width: must be 1..=1000 when set (same range as
+        // [lint] max_line_length). line_width = 0 makes every line "too long"
+        // in m1-fmt/m1-lint (issue #34).
+        if let Some(v) = self.format.line_width
+            && (v == 0 || v > 1000)
+        {
+            errors.push(ConfigError::LineWidthOutOfRange(v));
+        }
+
         // [format] indent_width: must be 1..=16 when set.
         if let Some(v) = self.format.indent_width
             && (v == 0 || v > 16)
@@ -405,14 +419,23 @@ mod tests {
         // hermetic to this temp tree.
         let cfg_path = dir.join(TOOLS_CONFIG_FILE);
 
-        // Malformed file -> Err(Parse), not a silent default.
+        // Issue #35: a malformed file must surface as `Err(Parse)` through the
+        // strict path, NOT be silently swallowed. The lenient `discover()` keeps
+        // returning `None` (for LSP contexts that can't surface diagnostics);
+        // callers that can report should use `discover_result()` to tell a
+        // parse error apart from an absent file. (The caller-side wiring in the
+        // m1-fmt/m1-lint CLIs rides in a separate PR — this repo only owns the
+        // distinction at the API boundary.)
         std::fs::write(&cfg_path, "[format\nindent_width = 4\n").unwrap();
         match M1ToolsConfig::discover_result(&sub) {
             Err(DiscoverError::Parse { path, .. }) => assert_eq!(path, cfg_path),
             other => panic!("expected Parse error, got {other:?}"),
         }
-        // ...while the lenient path stays lenient.
-        assert!(M1ToolsConfig::discover(&sub).is_none());
+        // ...while the lenient path stays lenient: same malformed file -> None.
+        assert!(
+            M1ToolsConfig::discover(&sub).is_none(),
+            "lenient discover() must swallow the parse error and return None"
+        );
 
         // Valid file -> found, parsed, unknown keys reported.
         std::fs::write(&cfg_path, "[format]\nindent_width = 2\nline_wdith = 9\n").unwrap();
@@ -524,6 +547,38 @@ mod tests {
         let lo = M1ToolsConfig::from_toml_str("[lint]\nmax_line_length = 1\n").unwrap();
         assert!(lo.validate().is_ok());
         let hi = M1ToolsConfig::from_toml_str("[lint]\nmax_line_length = 1000\n").unwrap();
+        assert!(hi.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_zero_line_width() {
+        // Issue #34: [format] line_width must be bounds-checked like
+        // max_line_length. line_width = 0 makes every line "too long".
+        let c = M1ToolsConfig::from_toml_str("[format]\nline_width = 0\n").unwrap();
+        let errs = c.validate().unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, ConfigError::LineWidthOutOfRange(0))),
+            "expected LineWidthOutOfRange(0), got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_absurd_line_width() {
+        let c = M1ToolsConfig::from_toml_str("[format]\nline_width = 1001\n").unwrap();
+        let errs = c.validate().unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, ConfigError::LineWidthOutOfRange(1001))),
+            "expected LineWidthOutOfRange(1001), got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_boundary_line_width() {
+        let lo = M1ToolsConfig::from_toml_str("[format]\nline_width = 1\n").unwrap();
+        assert!(lo.validate().is_ok());
+        let hi = M1ToolsConfig::from_toml_str("[format]\nline_width = 1000\n").unwrap();
         assert!(hi.validate().is_ok());
     }
 
