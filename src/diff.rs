@@ -14,14 +14,18 @@ pub enum Op {
 /// Split `s` into lines in a way that preserves the trailing-newline
 /// distinction. `str::lines()` normalises `"a\n"` and `"a"` to the same
 /// `["a"]`, making files that differ *only* in a trailing newline compare as
-/// identical. Instead we use `split('\n')`: the trailing `""` produced by a
-/// final `\n` is kept as a real element (representing the empty line *after*
-/// the last `\n`), while a string with no trailing newline has no such element.
+/// identical. Instead we split on `\n` and strip any trailing `\r` from each
+/// segment, handling both Unix (`\n`) and Windows (`\r\n`) line endings.
 ///
-/// The one-extra-empty-element convention matches what `str::split` already
-/// does — no special-casing needed at call sites.
+/// The trailing `""` produced by a final `\n` is kept as a real element
+/// (representing the empty line *after* the last `\n`), while a string with
+/// no trailing newline has no such element. The one-extra-empty-element
+/// convention matches what `str::split` already does — no special-casing
+/// needed at call sites.
 fn split_lines(s: &str) -> Vec<&str> {
-    s.split('\n').collect()
+    s.split('\n')
+        .map(|line| line.strip_suffix('\r').unwrap_or(line))
+        .collect()
 }
 
 /// Build a real unified diff between `original` and `formatted`, grouping edits
@@ -230,4 +234,47 @@ mod diff_tests {
             "context around change:\n{d}"
         );
     }
+
+    // ── CRLF tests ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn crlf_input_produces_no_stray_cr_in_diff() {
+        // CRLF files must diff cleanly: the \r must not appear in the output.
+        let original = "a\r\nb\r\nc\r\n";
+        let formatted = "a\r\nB\r\nc\r\n";
+        let d = unified_diff("demo.m1scr", original, formatted);
+        assert!(!d.contains('\r'), "stray \\r in diff output:\n{d:?}");
+        assert!(d.contains("-b"), "expected deletion of 'b':\n{d}");
+        assert!(d.contains("+B"), "expected insertion of 'B':\n{d}");
+    }
+
+    #[test]
+    fn crlf_and_lf_identical_content_compare_equal() {
+        // "a\r\nb\r\n" and "a\nb\n" have the same logical content line-by-line;
+        // after CRLF normalisation they should produce no diff.
+        let crlf = "a\r\nb\r\n";
+        let lf = "a\nb\n";
+        let d = unified_diff("demo.m1scr", crlf, lf);
+        assert!(
+            d.is_empty(),
+            "CRLF and LF with same content should diff as identical:\n{d}"
+        );
+    }
+
+    #[test]
+    fn crlf_context_lines_have_no_stray_cr() {
+        // Context lines (unchanged lines surrounding a change) must also be
+        // free of trailing \r when the input uses CRLF.
+        let original = "ctx1\r\nctx2\r\nchanged\r\nctx3\r\nctx4\r\n";
+        let formatted = "ctx1\r\nctx2\r\nCHANGED\r\nctx3\r\nctx4\r\n";
+        let d = unified_diff("demo.m1scr", original, formatted);
+        assert!(!d.contains('\r'), "stray \\r in context lines:\n{d:?}");
+        // Context lines should be present without \r.
+        assert!(
+            d.contains(" ctx1") || d.contains(" ctx2"),
+            "context missing:\n{d}"
+        );
+    }
+
+    // ── end CRLF tests ──────────────────────────────────────────────────────
 }

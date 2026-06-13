@@ -17,6 +17,10 @@ pub struct LineIndex {
 
 impl LineIndex {
     /// Build the index by scanning `text` once for newline (`\n`) boundaries.
+    ///
+    /// Both `\n` (Unix) and `\r\n` (Windows/CRLF) line endings are recognised.
+    /// Line-start offsets always point to the first byte *after* the newline
+    /// sequence, so byte offsets are preserved exactly as they appear in `text`.
     pub fn new(text: &str) -> Self {
         let mut starts = vec![0usize];
         starts.extend(
@@ -26,6 +30,27 @@ impl LineIndex {
                 .map(|(i, _)| i + 1),
         );
         LineIndex { starts }
+    }
+
+    /// Returns the byte offset just past the last non-newline byte on `line`,
+    /// i.e. the end of the line's visible content, excluding any trailing
+    /// `\r` or `\n`. Used internally to make column arithmetic CRLF-safe.
+    fn line_content_end(&self, text: &str, line: usize) -> usize {
+        // The raw end is the byte before the next line's start (the `\n`), or
+        // text.len() for the last line.
+        let raw_end = self
+            .starts
+            .get(line + 1)
+            .map(|&next| next.saturating_sub(1).min(text.len()))
+            .unwrap_or(text.len());
+        // Also strip a leading `\r` before the `\n` for CRLF sequences.
+        if raw_end > self.starts[line]
+            && text.as_bytes().get(raw_end.saturating_sub(1)) == Some(&b'\r')
+        {
+            raw_end - 1
+        } else {
+            raw_end
+        }
     }
 
     /// 0-based source line containing byte offset `pos`.
@@ -69,7 +94,12 @@ impl LineIndex {
             pos -= 1;
         }
         let line = self.line_at(pos);
-        let slice = &text[self.starts[line]..pos];
+        // Clamp pos to the content end of the line, so a position pointing at
+        // a trailing `\r` (CRLF) or `\n` is treated as end-of-content, not
+        // as a byte within the line's visible text.
+        let content_end = self.line_content_end(text, line);
+        let effective_pos = pos.min(content_end);
+        let slice = &text[self.starts[line]..effective_pos];
         let col = match enc {
             PositionEncoding::Utf8 => slice.len(),
             PositionEncoding::Utf16 => slice.chars().map(char::len_utf16).sum(),
@@ -94,16 +124,11 @@ impl LineIndex {
         let Some(&line_start) = self.starts.get(line) else {
             return text.len();
         };
-        // The next line-start sits one byte *after* this line's trailing `\n`;
-        // exclude that newline so an out-of-range column clamps to end-of-line
-        // rather than crossing into the next line (LSP spec §3.16.1, issue #33).
-        // The last line has no next start (and no trailing `\n`), so it ends at
-        // `text.len()`.
-        let line_end = self
-            .starts
-            .get(line + 1)
-            .map(|&next| next.saturating_sub(1).min(text.len()))
-            .unwrap_or(text.len());
+        // The content end excludes trailing `\n` (and `\r` for CRLF) so that
+        // an out-of-range column clamps to visible end-of-line rather than
+        // crossing into the newline sequence or the next line
+        // (LSP spec §3.16.1, issue #33).
+        let line_end = self.line_content_end(text, line);
         let mut remaining = column;
         let mut off = line_start;
         for c in text[line_start..line_end].chars() {
@@ -258,6 +283,84 @@ mod tests {
         assert_eq!(line1_eol, 5, "line 1 ends at byte 5 (before its '\\n')");
         assert_eq!(mi.position_in(m, line1_eol, PositionEncoding::Utf16).0, 1);
     }
+
+    // ── CRLF tests ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn crlf_line_starts_are_correct() {
+        // "line1\r\nline2\r\nline3\r\n" — line starts must be at 0, 7, 14.
+        let text = "line1\r\nline2\r\nline3\r\n";
+        let idx = LineIndex::new(text);
+        assert_eq!(idx.line_start(0), Some(0));
+        assert_eq!(idx.line_start(1), Some(7));
+        assert_eq!(idx.line_start(2), Some(14));
+        assert_eq!(idx.line_start(3), Some(21)); // trailing empty line after last \n
+    }
+
+    #[test]
+    fn crlf_line_at_is_correct() {
+        // "a\r\nb\r\n": 'a'@0, '\r'@1, '\n'@2, 'b'@3, '\r'@4, '\n'@5, ""@6
+        let text = "a\r\nb\r\n";
+        let idx = LineIndex::new(text);
+        assert_eq!(idx.line_at(0), 0, "'a' is on line 0");
+        assert_eq!(idx.line_at(1), 0, "'\\r' is still on line 0");
+        assert_eq!(idx.line_at(2), 0, "'\\n' is on line 0");
+        assert_eq!(idx.line_at(3), 1, "'b' is on line 1");
+        assert_eq!(idx.line_at(5), 1, "'\\n' of second CRLF is on line 1");
+        assert_eq!(idx.line_at(6), 2, "empty trailing line");
+    }
+
+    #[test]
+    fn crlf_position_in_excludes_cr_from_column() {
+        // "a\r\nb\r\n": 'b' is at byte 3; its column must be 0, not 1.
+        // A position pointing at the '\r' (byte 1) should give column 1 (end
+        // of visible content "a"), identical to pointing past "a" but not at
+        // the CR itself.
+        let text = "a\r\nb\r\n";
+        let li = LineIndex::new(text);
+        // 'a' at byte 0 → (0, 0)
+        assert_eq!(li.position_in(text, 0, PositionEncoding::Utf8), (0, 0));
+        // '\r' at byte 1 — must not count \r as line content; column = 1 (length of "a")
+        assert_eq!(
+            li.position_in(text, 1, PositionEncoding::Utf8),
+            (0, 1),
+            "\\r should be treated as end-of-content, column = len(\"a\") = 1"
+        );
+        // '\n' at byte 2 — same: column = 1
+        assert_eq!(li.position_in(text, 2, PositionEncoding::Utf8), (0, 1));
+        // 'b' at byte 3 → (1, 0)
+        assert_eq!(li.position_in(text, 3, PositionEncoding::Utf8), (1, 0));
+    }
+
+    #[test]
+    fn crlf_offset_in_does_not_include_cr() {
+        // offset_in with a column past end-of-content must stop before \r, not at \r.
+        let text = "abc\r\ndef\r\n";
+        let li = LineIndex::new(text);
+        // Line 0 visible content is "abc" (bytes 0..3); \r is at byte 3, \n at byte 4.
+        // An out-of-range column must clamp to byte 3 (just past 'c'), not byte 4 (\n).
+        let off = li.offset_in(text, 0, 999, PositionEncoding::Utf8);
+        assert_eq!(
+            off, 3,
+            "out-of-range column should stop after 'c', before \\r"
+        );
+        // Round-trip: position_in of that offset must stay on line 0.
+        assert_eq!(li.position_in(text, off, PositionEncoding::Utf8).0, 0);
+    }
+
+    #[test]
+    fn crlf_col_at_content_bytes() {
+        // col_at measures raw bytes from line start; the CRLF fix applies to
+        // position_in/offset_in — col_at itself reports the byte offset as-is.
+        let text = "ab\r\ncd\r\n";
+        let idx = LineIndex::new(text);
+        assert_eq!(idx.col_at(0), 0); // 'a'
+        assert_eq!(idx.col_at(1), 1); // 'b'
+        assert_eq!(idx.col_at(4), 0); // 'c' on line 1
+        assert_eq!(idx.col_at(5), 1); // 'd' on line 1
+    }
+
+    // ── end CRLF tests ──────────────────────────────────────────────────────
 
     #[test]
     fn position_in_mid_codepoint_byte_does_not_panic() {
