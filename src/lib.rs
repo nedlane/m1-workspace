@@ -49,7 +49,7 @@ pub const ROOT_PREFIX: &str = "Root.";
 ///
 /// Symlinks are skipped: `symlink_metadata` is used so that a symlink whose
 /// name matches `file_name` is never treated as a real project/config file,
-/// even if the target exists. This mirrors the guard in [`walk_ext`] that
+/// even if the target exists. This mirrors the guard in `walk_ext` that
 /// prevents symlinks from diverting tree-walk discovery out of the project
 /// (m1-workspace#7).
 pub fn find_upward(start: &Path, file_name: &str) -> Option<PathBuf> {
