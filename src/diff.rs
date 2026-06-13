@@ -11,14 +11,27 @@ pub enum Op {
     Insert,
 }
 
+/// Split `s` into lines in a way that preserves the trailing-newline
+/// distinction. `str::lines()` normalises `"a\n"` and `"a"` to the same
+/// `["a"]`, making files that differ *only* in a trailing newline compare as
+/// identical. Instead we use `split('\n')`: the trailing `""` produced by a
+/// final `\n` is kept as a real element (representing the empty line *after*
+/// the last `\n`), while a string with no trailing newline has no such element.
+///
+/// The one-extra-empty-element convention matches what `str::split` already
+/// does — no special-casing needed at call sites.
+fn split_lines(s: &str) -> Vec<&str> {
+    s.split('\n').collect()
+}
+
 /// Build a real unified diff between `original` and `formatted`, grouping edits
 /// into hunks with surrounding context — not a positional line-pairing, which
 /// reports every line after an insertion as changed (#79). Returns the empty
 /// string when the inputs are identical (no `--- / +++` header, no hunks).
 pub fn unified_diff(name: &str, original: &str, formatted: &str) -> String {
     const CONTEXT: usize = 3;
-    let a: Vec<&str> = original.lines().collect();
-    let b: Vec<&str> = formatted.lines().collect();
+    let a: Vec<&str> = split_lines(original);
+    let b: Vec<&str> = split_lines(formatted);
     let script = edit_script(&a, &b);
     if script.iter().all(|(op, _, _)| *op == Op::Equal) {
         return String::new();
@@ -179,6 +192,32 @@ mod diff_tests {
     fn identical_inputs_produce_no_hunks() {
         let d = unified_diff("demo.m1scr", "a\nb\n", "a\nb\n");
         assert!(!d.contains("@@"), "no changes -> no hunks:\n{d}");
+    }
+
+    #[test]
+    fn trailing_newline_distinction_is_preserved() {
+        // Files that differ ONLY in a trailing newline must not compare as
+        // identical. str::lines() normalises "a\n" and "a" to the same
+        // Vec<&str> (["a"]), masking the difference — relevant because
+        // `final_blank_line` is a first-class [format] knob that can cause
+        // exactly this kind of change.
+        let with_newline = "a\nb\n";
+        let without_newline = "a\nb";
+        let d = unified_diff("demo.m1scr", with_newline, without_newline);
+        assert!(
+            !d.is_empty(),
+            "files differing only in trailing newline must produce a non-empty diff:\n{d}"
+        );
+        assert!(d.contains("@@"), "expected a hunk header:\n{d}");
+
+        // Also verify the extra-blank-line case while we're here.
+        let without_extra = "a\n";
+        let with_extra = "a\n\n";
+        let d2 = unified_diff("demo.m1scr", without_extra, with_extra);
+        assert!(
+            !d2.is_empty(),
+            "files differing only in trailing blank line must produce a non-empty diff:\n{d2}"
+        );
     }
 
     #[test]

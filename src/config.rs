@@ -84,6 +84,8 @@ pub enum ConfigError {
     IndentWidthOutOfRange(usize),
     /// `[format] continuation_indent` must be ≥ 1 and ≤ 16.
     ContinuationIndentOutOfRange(usize),
+    /// `[format] max_blank_lines` must be ≤ 100 when set (0 is valid = strip all).
+    MaxBlankLinesOutOfRange(usize),
     /// `[lint] max_nesting_depth` must be ≥ 1.
     MaxNestingDepthZero,
     /// `[lint] max_cognitive_complexity` must be ≥ 1.
@@ -113,6 +115,9 @@ impl fmt::Display for ConfigError {
             }
             ConfigError::ContinuationIndentOutOfRange(v) => {
                 write!(f, "continuation_indent must be ≥ 1 and ≤ 16; got {v}")
+            }
+            ConfigError::MaxBlankLinesOutOfRange(v) => {
+                write!(f, "max_blank_lines must be ≤ 100; got {v}")
             }
             ConfigError::MaxNestingDepthZero => {
                 write!(f, "max_nesting_depth must be ≥ 1; got 0")
@@ -349,6 +354,13 @@ impl M1ToolsConfig {
             && (v == 0 || v > 16)
         {
             errors.push(ConfigError::ContinuationIndentOutOfRange(v));
+        }
+
+        // [format] max_blank_lines: 0 is valid (strip all); cap at 100.
+        if let Some(v) = self.format.max_blank_lines
+            && v > 100
+        {
+            errors.push(ConfigError::MaxBlankLinesOutOfRange(v));
         }
 
         // [diagnostics] ignore_symbols: each entry must be CODE:Symbol.Path.
@@ -742,6 +754,37 @@ mod tests {
             errs.iter()
                 .any(|e| matches!(e, ConfigError::MaxComplexityZero)),
             "expected MaxComplexityZero, got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_absurd_max_blank_lines() {
+        // [format] max_blank_lines > 100 is a config mistake — flag it.
+        let c = M1ToolsConfig::from_toml_str("[format]\nmax_blank_lines = 101\n").unwrap();
+        let errs = c.validate().unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, ConfigError::MaxBlankLinesOutOfRange(101))),
+            "expected MaxBlankLinesOutOfRange(101), got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_boundary_max_blank_lines() {
+        // 0 (strip all blank lines) and 100 (the cap) are both valid.
+        let lo = M1ToolsConfig::from_toml_str("[format]\nmax_blank_lines = 0\n").unwrap();
+        assert!(lo.validate().is_ok(), "max_blank_lines = 0 must be valid");
+        let hi = M1ToolsConfig::from_toml_str("[format]\nmax_blank_lines = 100\n").unwrap();
+        assert!(hi.validate().is_ok(), "max_blank_lines = 100 must be valid");
+    }
+
+    #[test]
+    fn max_blank_lines_error_display_mentions_value() {
+        let e = ConfigError::MaxBlankLinesOutOfRange(200);
+        let msg = e.to_string();
+        assert!(
+            msg.contains("200") && msg.contains("max_blank_lines"),
+            "display must mention field and value: {msg:?}"
         );
     }
 
