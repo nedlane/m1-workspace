@@ -69,6 +69,14 @@ pub struct DiagnosticsSection {
     /// source range (T010/T041/T050/T071/T087 …): entries of the form
     /// `"T050:Root.Engine.Speed"` suppress that code for that one symbol only.
     pub ignore_symbols: Option<Vec<String>>,
+    /// Per-rule severity reclassification: a `[diagnostics.severity]` table
+    /// maps a diagnostic code to the level it should report at, project-wide
+    /// and consistently across the CLIs and the editors (e.g. promote `L010`
+    /// to `error`, soften `L009` to `warning`). Keys are the same diagnostic
+    /// codes `ignore`/`select` accept; values are `error|warning|warn|info|
+    /// hint` (the spellings m1-lint's `[severity]` table accepts). Consumers
+    /// translate each entry onto their own severity type. (m1-lint #110.)
+    pub severity: Option<std::collections::BTreeMap<String, String>>,
 }
 
 /// A validation error produced by [`M1ToolsConfig::validate`].
@@ -99,6 +107,12 @@ pub enum ConfigError {
     MalformedDiagnosticCode(String),
     /// An entry in `[diagnostics] ignore_symbols` is not `CODE:Symbol.Path`.
     MalformedIgnoreSymbol(String),
+    /// A key in the `[diagnostics.severity]` table is not a valid diagnostic
+    /// code (same shapes as `ignore`/`select`).
+    MalformedSeverityCode(String),
+    /// A value in the `[diagnostics.severity]` table is not a known severity
+    /// level (`error|warning|warn|info|hint`).
+    UnknownSeverityLevel { code: String, level: String },
 }
 
 impl fmt::Display for ConfigError {
@@ -136,8 +150,28 @@ impl fmt::Display for ConfigError {
                 f,
                 "malformed ignore_symbols entry {entry:?}; expected CODE:Symbol.Path (e.g. \"T050:Root.Engine.Speed\")"
             ),
+            ConfigError::MalformedSeverityCode(code) => write!(
+                f,
+                "malformed [diagnostics.severity] code {code:?}; expected an uppercase letter + 3 digits (e.g. T041, L010) or a named code (e.g. syntax-error)"
+            ),
+            ConfigError::UnknownSeverityLevel { code, level } => write!(
+                f,
+                "unknown severity level {level:?} for [diagnostics.severity] code {code:?}; expected one of error|warning|warn|info|hint"
+            ),
         }
     }
+}
+
+/// Returns `true` if `level` is a severity-level spelling accepted by the
+/// `[diagnostics.severity]` table — case-insensitively, mirroring the spellings
+/// m1-lint's `parse_severity` accepts (`error|warning|warn|info|hint`). The
+/// crate is a leaf and does not own a `Severity` type, so it validates the
+/// spelling only; each consumer maps it onto its own severity enum.
+fn is_valid_severity_level(level: &str) -> bool {
+    matches!(
+        level.to_ascii_lowercase().as_str(),
+        "error" | "warning" | "warn" | "info" | "hint"
+    )
 }
 
 impl std::error::Error for ConfigError {}
@@ -385,6 +419,20 @@ impl M1ToolsConfig {
         for code in all_codes {
             if !is_valid_diagnostic_code(code) {
                 errors.push(ConfigError::MalformedDiagnosticCode(code.clone()));
+            }
+        }
+
+        // [diagnostics.severity]: each key is a diagnostic code (same shapes as
+        // ignore/select), each value a known severity level.
+        for (code, level) in self.diagnostics.severity.iter().flatten() {
+            if !is_valid_diagnostic_code(code) {
+                errors.push(ConfigError::MalformedSeverityCode(code.clone()));
+            }
+            if !is_valid_severity_level(level) {
+                errors.push(ConfigError::UnknownSeverityLevel {
+                    code: code.clone(),
+                    level: level.clone(),
+                });
             }
         }
 
@@ -875,6 +923,114 @@ mod tests {
         assert!(
             msg2.contains("99") && msg2.contains("indent_width"),
             "{msg2:?}"
+        );
+    }
+
+    // ── Per-rule severity overrides in [diagnostics] ────────────────────────
+
+    #[test]
+    fn parses_diagnostics_severity_table() {
+        // The unified config can now express per-rule severity reclassification
+        // (previously only reachable via a per-tool .m1lint.toml [severity]
+        // table) — a cross-tool concern that belongs alongside ignore/select.
+        let c = M1ToolsConfig::from_toml_str(
+            "[diagnostics.severity]\nL010 = \"error\"\nL009 = \"warning\"\n",
+        )
+        .unwrap();
+        let sev = c.diagnostics.severity.as_ref().expect("severity parsed");
+        assert_eq!(sev.get("L010").map(String::as_str), Some("error"));
+        assert_eq!(sev.get("L009").map(String::as_str), Some("warning"));
+        assert!(c.validate().is_ok(), "valid severity table must validate");
+    }
+
+    #[test]
+    fn validate_accepts_all_severity_levels() {
+        // The accepted spellings mirror m1-lint's parse_severity:
+        // error|warning|warn|info|hint (case-insensitive).
+        let c = M1ToolsConfig::from_toml_str(
+            "[diagnostics.severity]\nL001 = \"error\"\nL002 = \"warning\"\n\
+             L003 = \"warn\"\nL004 = \"info\"\nL005 = \"hint\"\nL006 = \"ERROR\"\n",
+        )
+        .unwrap();
+        assert!(
+            c.validate().is_ok(),
+            "all severity levels must validate: {:?}",
+            c.validate()
+        );
+    }
+
+    #[test]
+    fn validate_accepts_named_code_severity() {
+        // Named kebab-case core codes are valid severity keys too — the same
+        // shape ignore/select accepts.
+        let c = M1ToolsConfig::from_toml_str(
+            "[diagnostics.severity]\nsyntax-error = \"warning\"\nT080 = \"error\"\n",
+        )
+        .unwrap();
+        assert!(c.validate().is_ok(), "named code severity must validate");
+    }
+
+    #[test]
+    fn validate_rejects_malformed_severity_code() {
+        // A bad diagnostic-code key (lowercased/truncated tool code) is a config
+        // mistake, just like in ignore/select.
+        let c = M1ToolsConfig::from_toml_str(
+            "[diagnostics.severity]\nt010 = \"error\"\nL010 = \"warning\"\n",
+        )
+        .unwrap();
+        let errs = c.validate().unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, ConfigError::MalformedSeverityCode(s) if s == "t010")),
+            "expected MalformedSeverityCode(\"t010\"), got {errs:?}"
+        );
+        assert!(
+            !errs
+                .iter()
+                .any(|e| matches!(e, ConfigError::MalformedSeverityCode(s) if s == "L010")),
+            "L010 must be a valid code"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_unknown_severity_level() {
+        let c = M1ToolsConfig::from_toml_str(
+            "[diagnostics.severity]\nL010 = \"fatal\"\nL009 = \"error\"\n",
+        )
+        .unwrap();
+        let errs = c.validate().unwrap_err();
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                ConfigError::UnknownSeverityLevel { code, level }
+                    if code == "L010" && level == "fatal"
+            )),
+            "expected UnknownSeverityLevel for L010=fatal, got {errs:?}"
+        );
+        assert!(
+            !errs.iter().any(
+                |e| matches!(e, ConfigError::UnknownSeverityLevel { code, .. } if code == "L009")
+            ),
+            "L009=error must be valid"
+        );
+    }
+
+    #[test]
+    fn severity_error_display_is_actionable() {
+        let e = ConfigError::MalformedSeverityCode("t010".into());
+        let msg = e.to_string();
+        assert!(
+            msg.contains("t010") && msg.contains("severity"),
+            "display must mention the bad code and the section: {msg:?}"
+        );
+        let e2 = ConfigError::UnknownSeverityLevel {
+            code: "L010".into(),
+            level: "fatal".into(),
+        };
+        let msg2 = e2.to_string();
+        assert!(
+            msg2.contains("L010") && msg2.contains("fatal"),
+            "display must mention code and level: {msg2:?}"
         );
     }
 
