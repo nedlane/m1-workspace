@@ -141,6 +141,16 @@ fn read_dir_normalized(dir: &Path) -> std::io::Result<std::fs::ReadDir> {
 
 fn first_with_ext(dir: &Path, ext: &str) -> Option<PathBuf> {
     read_dir_normalized(dir).ok()?.flatten().find_map(|e| {
+        // Skip symlinks without following them, using the dir-entry's own file
+        // type. A crafted in-tree symlink (e.g. `parameters.m1cfg` -> a host
+        // `.m1cfg`) would otherwise divert config discovery out of the project
+        // tree and into the parameter model — the same escape closed for
+        // `find_upward` and `walk_ext` (m1-workspace#7). Returning `None` skips
+        // only this entry; `find_map` keeps scanning the directory.
+        let ft = e.file_type().ok()?;
+        if ft.is_symlink() {
+            return None;
+        }
         let p = e.path();
         (p.extension().and_then(|x| x.to_str()) == Some(ext)).then_some(p)
     })
@@ -274,6 +284,57 @@ mod tests {
         assert!(
             find_project_file(&start).is_none(),
             "find_upward must not follow a symlink named {PROJECT_FILE}"
+        );
+    }
+
+    /// find_config_file must NOT follow a symlink named `parameters.m1cfg`
+    /// that points to a `.m1cfg` outside the project tree. first_with_ext was
+    /// the last file-discovery helper missing the symlink guard that
+    /// find_upward and walk_ext already carry (m1-workspace#7).
+    #[cfg(unix)]
+    #[test]
+    fn find_config_file_skips_symlink_to_out_of_tree_file() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        // The project tree is `proj/`; search starts from `proj/sub/` so the
+        // ancestor walk stays within `proj/` (the real out-of-tree file is a
+        // sibling of `proj`, not an ancestor of the start dir).
+        let proj = tmp.path().join("proj");
+        let start = proj.join("sub");
+        fs::create_dir_all(&start).unwrap();
+        // The real .m1cfg lives outside the project tree.
+        let outside = tmp.path().join("elsewhere").join("outside.m1cfg");
+        fs::create_dir_all(outside.parent().unwrap()).unwrap();
+        fs::write(&outside, "<x/>").unwrap();
+        // proj/parameters.m1cfg is only a symlink to the out-of-tree file.
+        symlink(&outside, proj.join("parameters.m1cfg")).unwrap();
+        // Discovery must not divert to the symlink target.
+        assert!(
+            find_config_file(&start).is_none(),
+            "find_config_file must not follow a symlinked .m1cfg out of the tree"
+        );
+    }
+
+    /// A symlinked .m1cfg must be skipped while a real .m1cfg in the same
+    /// directory is still found (returning None for a symlink in find_map skips
+    /// only that entry; the scan continues).
+    #[cfg(unix)]
+    #[test]
+    fn find_config_file_skips_symlink_but_finds_real_sibling() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        let outside = tmp.path().join("outside.m1cfg");
+        fs::write(&outside, "<x/>").unwrap();
+        symlink(&outside, proj.join("symlinked.m1cfg")).unwrap();
+        // A genuine in-tree .m1cfg alongside the symlink.
+        let real = proj.join("parameters.m1cfg");
+        fs::write(&real, "<x/>").unwrap();
+        assert_eq!(
+            find_config_file(&proj),
+            Some(real),
+            "the real in-tree .m1cfg must still be found when a symlink is also present"
         );
     }
 
