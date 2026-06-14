@@ -142,6 +142,19 @@ impl fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
+/// Returns `true` if `code` is an M1 tool code: one uppercase ASCII letter
+/// followed by exactly three ASCII digits (`T041`, `L010`). This is the single
+/// source of truth for the `[A-Z][0-9]{3}` shape — both
+/// [`is_valid_diagnostic_code`] (for `[diagnostics] ignore`/`select`) and
+/// [`parse_ignore_symbol`] (for `[diagnostics] ignore_symbols`) call it, so the
+/// two never drift apart if the format changes.
+fn is_tool_code(code: &str) -> bool {
+    let b = code.as_bytes();
+    // The `len() == 4` guard must come first: it short-circuits so a too-short
+    // string (`T0`) can't pass via a vacuously-true `all()` over the digit slice.
+    b.len() == 4 && b[0].is_ascii_uppercase() && b[1..].iter().all(u8::is_ascii_digit)
+}
+
 /// Returns `true` if `code` is a valid diagnostic code. Two shapes exist:
 /// tool codes — one uppercase ASCII letter followed by exactly three ASCII
 /// digits (`T041`, `L010`) — and the named, digit-free kebab-case codes the
@@ -151,11 +164,7 @@ impl std::error::Error for ConfigError {}
 /// truncated tool codes like `t041`/`T41`) is a config mistake worth flagging.
 fn is_valid_diagnostic_code(code: &str) -> bool {
     let b = code.as_bytes();
-    let tool_code = b.len() == 4
-        && b[0].is_ascii_uppercase()
-        && b[1].is_ascii_digit()
-        && b[2].is_ascii_digit()
-        && b[3].is_ascii_digit();
+    let tool_code = is_tool_code(code);
     let named_code = b.len() >= 2
         && b.first().is_some_and(u8::is_ascii_lowercase)
         && b.last().is_some_and(u8::is_ascii_lowercase)
@@ -168,12 +177,7 @@ fn is_valid_diagnostic_code(code: &str) -> bool {
 /// symbol path. Returns `None` for anything else.
 pub fn parse_ignore_symbol(entry: &str) -> Option<(&str, &str)> {
     let (code, path) = entry.split_once(':')?;
-    let b = code.as_bytes();
-    let code_ok = b.len() == 4
-        && b[0].is_ascii_uppercase()
-        && b[1].is_ascii_digit()
-        && b[2].is_ascii_digit()
-        && b[3].is_ascii_digit();
+    let code_ok = is_tool_code(code);
     if code_ok && !path.trim().is_empty() {
         Some((code, path.trim()))
     } else {
@@ -761,6 +765,27 @@ mod tests {
             !bad.contains(&"annotation"),
             "multi-char named code 'annotation' must stay valid"
         );
+    }
+
+    #[test]
+    fn is_tool_code_recognises_the_a_z_3_digit_shape() {
+        // The single-source tool-code shape check shared by
+        // is_valid_diagnostic_code and parse_ignore_symbol: one uppercase ASCII
+        // letter followed by exactly three ASCII digits.
+        assert!(super::is_tool_code("T041"), "T041 is a tool code");
+        assert!(super::is_tool_code("L010"), "L010 is a tool code");
+        // Wrong case, length, or character class must all be rejected — and the
+        // length guard must short-circuit so a too-short string never passes
+        // via a vacuously-true digit-slice check.
+        assert!(!super::is_tool_code("t041"), "lowercase prefix");
+        assert!(!super::is_tool_code("T41"), "too short");
+        assert!(
+            !super::is_tool_code("T0"),
+            "far too short (vacuous-all guard)"
+        );
+        assert!(!super::is_tool_code("T0411"), "too long");
+        assert!(!super::is_tool_code("TT41"), "non-digit body");
+        assert!(!super::is_tool_code(""), "empty");
     }
 
     #[test]
