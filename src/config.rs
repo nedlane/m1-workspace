@@ -146,8 +146,9 @@ impl std::error::Error for ConfigError {}
 /// tool codes — one uppercase ASCII letter followed by exactly three ASCII
 /// digits (`T041`, `L010`) — and the named, digit-free kebab-case codes the
 /// LSP layer publishes for m1-core diagnostics (`syntax-error`,
-/// `unsupported-c-token`). Anything else (notably lowercased or truncated
-/// tool codes like `t041`/`T41`) is a config mistake worth flagging.
+/// `unsupported-c-token`). Named codes are at least two bytes — a single
+/// letter (`a`) is a typo, not a name. Anything else (notably lowercased or
+/// truncated tool codes like `t041`/`T41`) is a config mistake worth flagging.
 fn is_valid_diagnostic_code(code: &str) -> bool {
     let b = code.as_bytes();
     let tool_code = b.len() == 4
@@ -155,7 +156,7 @@ fn is_valid_diagnostic_code(code: &str) -> bool {
         && b[1].is_ascii_digit()
         && b[2].is_ascii_digit()
         && b[3].is_ascii_digit();
-    let named_code = !b.is_empty()
+    let named_code = b.len() >= 2
         && b.first().is_some_and(u8::is_ascii_lowercase)
         && b.last().is_some_and(u8::is_ascii_lowercase)
         && b.iter().all(|c| c.is_ascii_lowercase() || *c == b'-');
@@ -724,6 +725,41 @@ mod tests {
             c.validate().is_ok(),
             "named core codes must be valid: {:?}",
             c.validate()
+        );
+    }
+
+    #[test]
+    fn validate_rejects_single_char_diagnostic_code() {
+        // A single lowercase letter (`"a"`, `"x"`) is a typo, not a named
+        // kebab-case code: for a 1-byte string `first == last`, so the old
+        // first/last-lowercase check passed it. Named codes are at least two
+        // bytes (`annotation` is the shortest real one).
+        let c = M1ToolsConfig::from_toml_str(
+            "[diagnostics]\nignore = [\"a\", \"x\"]\nselect = [\"annotation\"]\n",
+        )
+        .unwrap();
+        let errs = c.validate().unwrap_err();
+        let bad: Vec<_> = errs
+            .iter()
+            .filter_map(|e| {
+                if let ConfigError::MalformedDiagnosticCode(s) = e {
+                    Some(s.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(
+            bad.contains(&"a"),
+            "single-char 'a' must be invalid, got {errs:?}"
+        );
+        assert!(
+            bad.contains(&"x"),
+            "single-char 'x' must be invalid, got {errs:?}"
+        );
+        assert!(
+            !bad.contains(&"annotation"),
+            "multi-char named code 'annotation' must stay valid"
         );
     }
 
