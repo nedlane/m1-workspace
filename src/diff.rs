@@ -46,10 +46,10 @@ const MAX_DIFF_CELLS: usize = 50_000_000;
 /// reports every line after an insertion as changed (#79). Returns the empty
 /// string when the inputs are identical (no `--- / +++` header, no hunks).
 ///
-/// When the two inputs are so large that the LCS table would exceed
-/// [`MAX_DIFF_CELLS`], a single placeholder hunk is emitted instead of running
-/// the quadratic-memory diff, so an oversized or degenerate input cannot OOM /
-/// abort the process (#82).
+/// When the two inputs are so large that the LCS table would exceed the
+/// internal cell cap (`MAX_DIFF_CELLS`), a single placeholder hunk is emitted
+/// instead of running the quadratic-memory diff, so an oversized or degenerate
+/// input cannot OOM / abort the process (#82).
 pub fn unified_diff(name: &str, original: &str, formatted: &str) -> String {
     const CONTEXT: usize = 3;
     let a: Vec<&str> = split_lines(original);
