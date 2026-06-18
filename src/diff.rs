@@ -28,14 +28,47 @@ fn split_lines(s: &str) -> Vec<&str> {
         .collect()
 }
 
+/// Upper bound on the number of cells (`n * m`) the LCS dynamic-programming
+/// table in [`edit_script`] is allowed to allocate. The table is
+/// `vec![vec![0usize; m + 1]; n + 1]` — 8 bytes per cell — so memory grows
+/// quadratically with the line counts of the two inputs. The read path caps a
+/// file at 64 MiB ([`crate::decode::MAX_TEXT_FILE_BYTES`]), but a degenerate
+/// input of millions of single-character lines would still size the table to
+/// hundreds of terabytes and abort the process. 50 million cells ≈ 400 MiB for
+/// the table itself, which comfortably covers any real M1 file pair while
+/// keeping the worst case bounded. Larger pairs fall back to a placeholder hunk
+/// (mirroring git's "files differ" behaviour) instead of attempting the
+/// allocation — see #82.
+const MAX_DIFF_CELLS: usize = 50_000_000;
+
 /// Build a real unified diff between `original` and `formatted`, grouping edits
 /// into hunks with surrounding context — not a positional line-pairing, which
 /// reports every line after an insertion as changed (#79). Returns the empty
 /// string when the inputs are identical (no `--- / +++` header, no hunks).
+///
+/// When the two inputs are so large that the LCS table would exceed
+/// [`MAX_DIFF_CELLS`], a single placeholder hunk is emitted instead of running
+/// the quadratic-memory diff, so an oversized or degenerate input cannot OOM /
+/// abort the process (#82).
 pub fn unified_diff(name: &str, original: &str, formatted: &str) -> String {
     const CONTEXT: usize = 3;
     let a: Vec<&str> = split_lines(original);
     let b: Vec<&str> = split_lines(formatted);
+
+    // Guard the quadratic-memory LCS table: if the inputs would size it past
+    // MAX_DIFF_CELLS, bail out without allocating. We still need to know whether
+    // the inputs actually differ so identical large files report no change.
+    if a.len().saturating_mul(b.len()) > MAX_DIFF_CELLS {
+        if a == b {
+            return String::new();
+        }
+        return format!(
+            "--- {name} (original)\n\
+             +++ {name} (formatted)\n\
+             @@ files differ (diff too large to display) @@\n"
+        );
+    }
+
     let script = edit_script(&a, &b);
     if script.iter().all(|(op, _, _)| *op == Op::Equal) {
         return String::new();
@@ -277,4 +310,63 @@ mod diff_tests {
     }
 
     // ── end CRLF tests ──────────────────────────────────────────────────────
+
+    // ── oversized-input guard tests (#82) ───────────────────────────────────
+
+    #[test]
+    fn oversized_differing_inputs_return_placeholder_without_huge_alloc() {
+        // Two large multi-line inputs whose product of line counts exceeds
+        // MAX_DIFF_CELLS must NOT attempt the quadratic LCS allocation (which
+        // would be tens of GB). Instead a single placeholder hunk is returned
+        // quickly. 200k vs 200k lines = 4e10 cells = 320 GB if allocated.
+        let original: String = (0..200_000).map(|i| format!("a{i}\n")).collect();
+        let formatted: String = (0..200_000).map(|i| format!("b{i}\n")).collect();
+        let d = unified_diff("big.m1scr", &original, &formatted);
+        assert!(
+            d.contains("diff too large to display"),
+            "expected oversized placeholder, got:\n{}",
+            &d[..d.len().min(200)]
+        );
+        // Still a well-formed unified-diff header so callers can print it.
+        assert!(
+            d.contains("--- big.m1scr (original)"),
+            "missing header:\n{d}"
+        );
+        assert!(
+            d.contains("+++ big.m1scr (formatted)"),
+            "missing header:\n{d}"
+        );
+    }
+
+    #[test]
+    fn oversized_identical_inputs_report_no_change() {
+        // Even past the cell cap, identical inputs must report no diff — the
+        // guard must not spuriously claim a change for huge-but-equal files.
+        let text: String = (0..200_000).map(|i| format!("line{i}\n")).collect();
+        let d = unified_diff("big.m1scr", &text, &text);
+        assert!(
+            d.is_empty(),
+            "identical oversized inputs must produce no diff:\n{}",
+            &d[..d.len().min(200)]
+        );
+    }
+
+    #[test]
+    fn under_cap_inputs_still_use_real_lcs_diff() {
+        // A pair just under the cap must still take the precise LCS path, not
+        // the placeholder. Keep it small but multi-line to exercise hunking.
+        let original = "a\nb\nc\nd\ne\n";
+        let formatted = "a\nb\nX\nd\ne\n";
+        let d = unified_diff("ok.m1scr", original, formatted);
+        assert!(
+            !d.contains("diff too large"),
+            "small inputs must not hit the placeholder:\n{d}"
+        );
+        assert!(
+            d.contains("-c") && d.contains("+X"),
+            "expected real diff:\n{d}"
+        );
+    }
+
+    // ── end oversized-input guard tests ─────────────────────────────────────
 }
