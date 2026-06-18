@@ -57,6 +57,13 @@ pub struct FormatSection {
     /// End the file with one blank line instead of a bare newline — the
     /// formatter pair of m1-lint L027 (m1-fmt #116).
     pub final_blank_line: Option<bool>,
+    /// Globs (e.g. `"*.gen.m1scr"`) the formatter must skip when expanding a
+    /// directory argument — the formatter pair of [`LintSection::exclude`].
+    /// Without it a team can tell the linter to ignore generated/vendored
+    /// scripts but cannot stop the formatter from rewriting the very same
+    /// files. Independent of `[lint] exclude` (additive), so existing
+    /// lint-only configs are unaffected.
+    pub exclude: Option<Vec<String>>,
 }
 
 /// `[diagnostics]` — cross-tool code filter (L-codes and T-codes).
@@ -468,6 +475,7 @@ mod tests {
              [format]\nline_width = 100\nmax_blank_lines = 2\nindent_style = \"tab\"\n\
              indent_width = 4\nbrace_style = \"allman\"\ncontinuation_indent = 1\n\
              align_assignments = false\nreflow_comments = false\nfinal_blank_line = false\n\
+             exclude = []\n\
              [diagnostics]\nignore = []\nselect = []\nignore_symbols = []\n";
         let (_, unknown) = M1ToolsConfig::from_toml_str_with_unknown_keys(toml).unwrap();
         assert_eq!(unknown, Vec::<String>::new());
@@ -526,6 +534,21 @@ mod tests {
             c.lint.exclude.as_deref(),
             Some(&["*.gen.m1scr".to_string()][..])
         );
+        // `[format] exclude` (issue: lint-only parity gap) round-trips
+        // independently of `[lint] exclude`.
+        let f =
+            M1ToolsConfig::from_toml_str("[format]\nexclude = [\"*.gen.m1scr\", \"vendor/*\"]\n")
+                .unwrap();
+        assert_eq!(
+            f.format.exclude.as_deref(),
+            Some(&["*.gen.m1scr".to_string(), "vendor/*".to_string()][..]),
+            "[format] exclude must parse as the formatter pair of [lint] exclude"
+        );
+        // The two exclude lists are independent: a lint-only config leaves the
+        // format list None (additive — existing configs unaffected).
+        let lint_only =
+            M1ToolsConfig::from_toml_str("[lint]\nexclude = [\"*.gen.m1scr\"]\n").unwrap();
+        assert_eq!(lint_only.format.exclude, None);
         assert_eq!(c.format.brace_style.as_deref(), Some("kr"));
         assert_eq!(c.format.indent_style.as_deref(), Some("spaces"));
         assert_eq!(c.format.indent_width, Some(2));
