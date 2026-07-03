@@ -78,12 +78,45 @@ pub fn find_project_file(start: &Path) -> Option<PathBuf> {
 pub fn find_config_file(start: &Path) -> Option<PathBuf> {
     let mut dir = Some(start);
     while let Some(d) = dir {
-        if let Some(found) = first_with_ext(d, CONFIG_EXT) {
+        if let Some(found) = pick_config(d) {
             return Some(found);
         }
         dir = d.parent();
     }
     None
+}
+
+/// The canonical `.m1cfg` basename. A project's parameter model lives in
+/// `parameters.m1cfg`; a directory may also hold `backup.m1cfg`, an export, etc.
+const CANONICAL_CONFIG: &str = "parameters.m1cfg";
+
+/// Choose the `.m1cfg` in `dir` that becomes the project's parameter model.
+/// Deterministic regardless of `readdir` order: prefer the canonical
+/// `parameters.m1cfg`, otherwise the lexicographically-first match. (Previously
+/// the raw `readdir`-order first match, so a directory with several `.m1cfg`
+/// files silently picked an arbitrary one — machine-dependently corrupting
+/// T030/hover/completion, since the chosen file *is* the parameter-type model.)
+fn pick_config(dir: &Path) -> Option<PathBuf> {
+    let mut matches: Vec<PathBuf> = read_dir_normalized(dir)
+        .ok()?
+        .flatten()
+        .filter_map(|e| {
+            // Skip symlinks without following them (m1-workspace#7) — a crafted
+            // in-tree `parameters.m1cfg` -> host-file symlink must not divert
+            // config discovery out of the project tree.
+            if e.file_type().ok()?.is_symlink() {
+                return None;
+            }
+            let p = e.path();
+            (p.extension().and_then(|x| x.to_str()) == Some(CONFIG_EXT)).then_some(p)
+        })
+        .collect();
+    matches.sort();
+    matches
+        .iter()
+        .find(|p| p.file_name().and_then(|n| n.to_str()) == Some(CANONICAL_CONFIG))
+        .cloned()
+        .or_else(|| matches.into_iter().next())
 }
 
 /// All `*.m1dbc` files under `root`, searched recursively (CAN databases
@@ -137,23 +170,6 @@ fn read_dir_normalized(dir: &Path) -> std::io::Result<std::fs::ReadDir> {
         dir
     };
     std::fs::read_dir(dir)
-}
-
-fn first_with_ext(dir: &Path, ext: &str) -> Option<PathBuf> {
-    read_dir_normalized(dir).ok()?.flatten().find_map(|e| {
-        // Skip symlinks without following them, using the dir-entry's own file
-        // type. A crafted in-tree symlink (e.g. `parameters.m1cfg` -> a host
-        // `.m1cfg`) would otherwise divert config discovery out of the project
-        // tree and into the parameter model — the same escape closed for
-        // `find_upward` and `walk_ext` (m1-workspace#7). Returning `None` skips
-        // only this entry; `find_map` keeps scanning the directory.
-        let ft = e.file_type().ok()?;
-        if ft.is_symlink() {
-            return None;
-        }
-        let p = e.path();
-        (p.extension().and_then(|x| x.to_str()) == Some(ext)).then_some(p)
-    })
 }
 
 /// Maximum directory depth [`walk_ext`] descends. Real projects nest a handful
@@ -288,9 +304,9 @@ mod tests {
     }
 
     /// find_config_file must NOT follow a symlink named `parameters.m1cfg`
-    /// that points to a `.m1cfg` outside the project tree. first_with_ext was
-    /// the last file-discovery helper missing the symlink guard that
-    /// find_upward and walk_ext already carry (m1-workspace#7).
+    /// that points to a `.m1cfg` outside the project tree. `pick_config` carries
+    /// the symlink guard that find_upward and walk_ext already have
+    /// (m1-workspace#7).
     #[cfg(unix)]
     #[test]
     fn find_config_file_skips_symlink_to_out_of_tree_file() {
@@ -315,9 +331,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn find_config_file_prefers_canonical_over_arbitrary() {
+        // Several `.m1cfg` in one dir must resolve deterministically to the
+        // canonical `parameters.m1cfg` — never a readdir-order-arbitrary pick,
+        // since the chosen file becomes the whole toolchain's parameter model.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        // Write a name that would sort before "parameters" so a naive "first"
+        // (lexicographic or readdir) could win instead.
+        fs::write(dir.join("backup.m1cfg"), "<x/>").unwrap();
+        fs::write(dir.join("parameters.m1cfg"), "<x/>").unwrap();
+        fs::write(dir.join("zzz.m1cfg"), "<x/>").unwrap();
+        let got = find_config_file(dir).unwrap();
+        assert_eq!(got.file_name().unwrap(), "parameters.m1cfg");
+    }
+
+    #[test]
+    fn find_config_file_is_deterministic_without_canonical() {
+        // With no canonical name present, the pick is the lexicographically
+        // first match (deterministic), not readdir order.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        fs::write(dir.join("bravo.m1cfg"), "<x/>").unwrap();
+        fs::write(dir.join("alpha.m1cfg"), "<x/>").unwrap();
+        let got = find_config_file(dir).unwrap();
+        assert_eq!(got.file_name().unwrap(), "alpha.m1cfg");
+    }
+
     /// A symlinked .m1cfg must be skipped while a real .m1cfg in the same
-    /// directory is still found (returning None for a symlink in find_map skips
-    /// only that entry; the scan continues).
+    /// directory is still found (returning None for a symlink skips only that
+    /// entry; the scan continues).
     #[cfg(unix)]
     #[test]
     fn find_config_file_skips_symlink_but_finds_real_sibling() {

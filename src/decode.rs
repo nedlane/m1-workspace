@@ -93,6 +93,29 @@ pub fn decode(bytes: Vec<u8>) -> String {
 /// (m1-project) needs this to re-encode on write-back instead of transcoding a
 /// Windows-1252 file to UTF-8 behind MoTeC's back.
 pub fn decode_with_encoding(bytes: Vec<u8>) -> (String, Encoding) {
+    // UTF-16 with a byte-order mark (a Notepad "Unicode" / "Unicode big endian"
+    // save): decode it properly instead of mojibaking every second byte through
+    // the Windows-1252 fallback below. M1 files are UTF-8 / Windows-1252, so a
+    // UTF-16 source is already non-standard — we normalise it to a correct
+    // Unicode string (reported as UTF-8, so a write-back lands in a standard
+    // encoding) rather than preserving the UTF-16 form.
+    let utf16_le =
+        bytes.starts_with(&[0xFF, 0xFE]) && !bytes.starts_with(&[0xFF, 0xFE, 0x00, 0x00]);
+    let utf16_be = bytes.starts_with(&[0xFE, 0xFF]);
+    if utf16_le || utf16_be {
+        let units: Vec<u16> = bytes[2..]
+            .chunks_exact(2)
+            .map(|c| {
+                if utf16_le {
+                    u16::from_le_bytes([c[0], c[1]])
+                } else {
+                    u16::from_be_bytes([c[0], c[1]])
+                }
+            })
+            .collect();
+        return (String::from_utf16_lossy(&units), Encoding::Utf8);
+    }
+
     // Strip a leading UTF-8 BOM (EF BB BF) so the decoded text begins with the
     // document's first real character, not U+FEFF — a stray BOM shifts
     // diagnostic columns and breaks strict leading-token checks, and on the
@@ -277,6 +300,27 @@ mod tests {
     fn utf8_passes_through_unchanged() {
         let (s, enc) = decode_with_encoding("Qty=\"°/s\"".as_bytes().to_vec());
         assert_eq!(s, "Qty=\"°/s\"");
+        assert_eq!(enc, Encoding::Utf8);
+    }
+
+    #[test]
+    fn utf16_le_bom_is_decoded_not_mojibaked() {
+        // A Notepad "Unicode" save: UTF-16 LE BOM + "A°" as u16 code units.
+        let mut bytes = vec![0xFF, 0xFE]; // BOM
+        bytes.extend_from_slice(&[0x41, 0x00]); // 'A'
+        bytes.extend_from_slice(&[0xB0, 0x00]); // '°'
+        let (s, enc) = decode_with_encoding(bytes);
+        assert_eq!(s, "A°");
+        assert_eq!(enc, Encoding::Utf8);
+    }
+
+    #[test]
+    fn utf16_be_bom_is_decoded() {
+        let mut bytes = vec![0xFE, 0xFF]; // BE BOM
+        bytes.extend_from_slice(&[0x00, 0x41]); // 'A'
+        bytes.extend_from_slice(&[0x00, 0xB0]); // '°'
+        let (s, enc) = decode_with_encoding(bytes);
+        assert_eq!(s, "A°");
         assert_eq!(enc, Encoding::Utf8);
     }
 

@@ -29,12 +29,12 @@ fn split_lines(s: &str) -> Vec<&str> {
 }
 
 /// Upper bound on the number of cells (`n * m`) the LCS dynamic-programming
-/// table in [`edit_script`] is allowed to allocate. The table is
-/// `vec![vec![0usize; m + 1]; n + 1]` — 8 bytes per cell — so memory grows
+/// table in [`edit_script`] is allowed to allocate. The table is a flat
+/// `vec![0u32; (n + 1) * (m + 1)]` — 4 bytes per cell — so memory grows
 /// quadratically with the line counts of the two inputs. The read path caps a
 /// file at 64 MiB ([`crate::decode::MAX_TEXT_FILE_BYTES`]), but a degenerate
 /// input of millions of single-character lines would still size the table to
-/// hundreds of terabytes and abort the process. 50 million cells ≈ 400 MiB for
+/// tens of terabytes and abort the process. 50 million cells ≈ 200 MiB for
 /// the table itself, which comfortably covers any real M1 file pair while
 /// keeping the worst case bounded. Larger pairs fall back to a placeholder hunk
 /// (mirroring git's "files differ" behaviour) instead of attempting the
@@ -52,16 +52,24 @@ const MAX_DIFF_CELLS: usize = 50_000_000;
 /// input cannot OOM / abort the process (#82).
 pub fn unified_diff(name: &str, original: &str, formatted: &str) -> String {
     const CONTEXT: usize = 3;
+
+    // Empty output must mean byte-identical: a caller using
+    // `unified_diff(...).is_empty()` as a change detector has to agree with a
+    // raw byte comparison (m1-fmt `--check`). `split_lines` strips each line's
+    // `\r`, so an inputs-differ-only-in-line-endings pair has equal *lines* — we
+    // must not report that as "no change" (previously `--check` failed a
+    // mixed-EOL file while `--diff` printed nothing).
+    if original == formatted {
+        return String::new();
+    }
+
     let a: Vec<&str> = split_lines(original);
     let b: Vec<&str> = split_lines(formatted);
 
     // Guard the quadratic-memory LCS table: if the inputs would size it past
-    // MAX_DIFF_CELLS, bail out without allocating. We still need to know whether
-    // the inputs actually differ so identical large files report no change.
+    // MAX_DIFF_CELLS, bail out without allocating. The inputs are known to
+    // differ (byte check above), so this always reports a change.
     if a.len().saturating_mul(b.len()) > MAX_DIFF_CELLS {
-        if a == b {
-            return String::new();
-        }
         return format!(
             "--- {name} (original)\n\
              +++ {name} (formatted)\n\
@@ -71,7 +79,14 @@ pub fn unified_diff(name: &str, original: &str, formatted: &str) -> String {
 
     let script = edit_script(&a, &b);
     if script.iter().all(|(op, _, _)| *op == Op::Equal) {
-        return String::new();
+        // Lines match but the bytes differ (checked above) — the change is in
+        // line endings (CRLF vs LF), which `split_lines` normalises away. Report
+        // it rather than printing nothing.
+        return format!(
+            "--- {name} (original)\n\
+             +++ {name} (formatted)\n\
+             @@ line endings differ (no content change) @@\n"
+        );
     }
 
     // Group consecutive non-equal ops (plus up to CONTEXT equal lines on each
@@ -166,14 +181,20 @@ pub fn unified_diff(name: &str, original: &str, formatted: &str) -> String {
 /// `Insert` only `b_index` (the other is the last consumed index, unused).
 fn edit_script(a: &[&str], b: &[&str]) -> Vec<(Op, usize, usize)> {
     let (n, m) = (a.len(), b.len());
-    // LCS length DP table.
-    let mut dp = vec![vec![0usize; m + 1]; n + 1];
+    let w = m + 1;
+    // LCS length DP in a single flat buffer indexed `i * w + j`, rather than
+    // `n + 1` separately-heap-allocated rows: one contiguous allocation with
+    // better cache locality, and `u32` cells (a line count never exceeds the
+    // 64 MiB read cap) halve the memory versus `usize`. `dp[i][j]` fits in u32
+    // because it is bounded by `min(n, m)`, itself bounded by the file size.
+    let idx = |i: usize, j: usize| i * w + j;
+    let mut dp = vec![0u32; (n + 1) * w];
     for i in (0..n).rev() {
         for j in (0..m).rev() {
-            dp[i][j] = if a[i] == b[j] {
-                dp[i + 1][j + 1] + 1
+            dp[idx(i, j)] = if a[i] == b[j] {
+                dp[idx(i + 1, j + 1)] + 1
             } else {
-                dp[i + 1][j].max(dp[i][j + 1])
+                dp[idx(i + 1, j)].max(dp[idx(i, j + 1)])
             };
         }
     }
@@ -185,7 +206,7 @@ fn edit_script(a: &[&str], b: &[&str]) -> Vec<(Op, usize, usize)> {
             script.push((Op::Equal, i, j));
             i += 1;
             j += 1;
-        } else if dp[i + 1][j] >= dp[i][j + 1] {
+        } else if dp[idx(i + 1, j)] >= dp[idx(i, j + 1)] {
             script.push((Op::Delete, i, j));
             i += 1;
         } else {
@@ -229,6 +250,20 @@ mod diff_tests {
     fn identical_inputs_produce_no_hunks() {
         let d = unified_diff("demo.m1scr", "a\nb\n", "a\nb\n");
         assert!(!d.contains("@@"), "no changes -> no hunks:\n{d}");
+    }
+
+    #[test]
+    fn line_ending_only_difference_is_reported() {
+        // `--check` fails a mixed-EOL file, so `--diff` must not print nothing:
+        // empty output has to mean byte-identical. A CRLF-vs-LF-only difference
+        // is non-empty (a note), and a truly identical pair is empty.
+        let crlf = unified_diff("demo.m1scr", "a\r\nb\r\n", "a\nb\n");
+        assert!(!crlf.is_empty(), "EOL-only change must not be empty");
+        assert!(crlf.contains("line endings differ"), "{crlf}");
+        assert!(
+            unified_diff("demo.m1scr", "a\nb\n", "a\nb\n").is_empty(),
+            "byte-identical must be empty"
+        );
     }
 
     #[test]
@@ -282,16 +317,16 @@ mod diff_tests {
     }
 
     #[test]
-    fn crlf_and_lf_identical_content_compare_equal() {
-        // "a\r\nb\r\n" and "a\nb\n" have the same logical content line-by-line;
-        // after CRLF normalisation they should produce no diff.
-        let crlf = "a\r\nb\r\n";
-        let lf = "a\nb\n";
-        let d = unified_diff("demo.m1scr", crlf, lf);
-        assert!(
-            d.is_empty(),
-            "CRLF and LF with same content should diff as identical:\n{d}"
-        );
+    fn crlf_vs_lf_same_content_is_reported_not_empty() {
+        // Same logical content but different line endings is a real, byte-level
+        // difference (m1-fmt unifies the EOLs of a mixed file, which `--check`
+        // flags): `unified_diff` must NOT report it as "no change", or `--diff`
+        // prints nothing for a file `--check` fails. The change carries no stray
+        // `\r` — it is summarised as an EOL note, not a content hunk.
+        let d = unified_diff("demo.m1scr", "a\r\nb\r\n", "a\nb\n");
+        assert!(!d.is_empty(), "EOL-only difference must be reported:\n{d}");
+        assert!(!d.contains('\r'), "no stray \\r in the note:\n{d:?}");
+        assert!(d.contains("line endings differ"), "{d}");
     }
 
     #[test]
