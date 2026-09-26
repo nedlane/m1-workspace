@@ -104,7 +104,9 @@ pub fn decode_with_encoding(bytes: Vec<u8>) -> (String, Encoding) {
     let utf16_be = bytes.starts_with(&[0xFE, 0xFF]);
     if utf16_le || utf16_be {
         let units: Vec<u16> = bytes[2..]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| {
                 if utf16_le {
                     u16::from_le_bytes([c[0], c[1]])
