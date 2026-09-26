@@ -52,6 +52,8 @@ pub struct FormatSection {
     pub continuation_indent: Option<usize>,
     /// Align consecutive `=` assignments into a column (m1-fmt #96).
     pub align_assignments: Option<bool>,
+    /// Put boolean comparisons on separate rows and align their operators.
+    pub align_conditions: Option<bool>,
     /// Re-wrap block and line comments to the line width (m1-fmt #95).
     pub reflow_comments: Option<bool>,
     /// End the file with one blank line instead of a bare newline — the
@@ -690,6 +692,14 @@ mod tests {
                 .any(|e| matches!(e, ConfigError::IndentWidthOutOfRange(17))),
             "expected IndentWidthOutOfRange(17), got {errs:?}"
         );
+    }
+
+    #[test]
+    fn parses_condition_alignment() {
+        let c = M1ToolsConfig::from_toml_str("[format]\nalign_conditions = true\n").unwrap();
+        assert_eq!(c.format.align_conditions, Some(true));
+        assert_eq!(M1ToolsConfig::default().format.align_conditions, None);
+        assert!(M1ToolsConfig::from_toml_str("[format]\nalign_conditions = 1\n").is_err());
     }
 
     #[test]
