@@ -49,7 +49,8 @@ pub fn read_text(path: &Path) -> io::Result<String> {
 
 /// Like [`read_text`] but with a caller-supplied size cap (in bytes). A file
 /// larger than `max_bytes` returns `ErrorKind::InvalidData` after a cheap
-/// metadata check, before any large allocation.
+/// metadata check, before any large allocation. The read itself is also bounded
+/// in case the file grows or its reported size is incomplete.
 pub fn read_text_capped(path: &Path, max_bytes: u64) -> io::Result<String> {
     Ok(decode(read_bytes_capped(path, max_bytes)?))
 }
@@ -73,14 +74,26 @@ pub fn read_text_with_encoding(path: &Path) -> io::Result<(String, Encoding)> {
 /// Read a file's raw bytes, rejecting anything larger than `max_bytes` via a
 /// metadata pre-check so an oversized input fails fast instead of OOMing.
 fn read_bytes_capped(path: &Path, max_bytes: u64) -> io::Result<Vec<u8>> {
-    let len = std::fs::metadata(path)?.len();
+    use std::io::Read;
+
+    let file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
     if len > max_bytes {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("file is {len} bytes, exceeding the {max_bytes}-byte read limit"),
         ));
     }
-    std::fs::read(path)
+    let mut bytes = Vec::new();
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("file exceeds the {max_bytes}-byte read limit"),
+        ));
+    }
+    Ok(bytes)
 }
 
 /// Decode bytes as UTF-8, falling back to Windows-1252 if they are not valid
