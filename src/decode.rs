@@ -73,23 +73,16 @@ pub fn read_text_with_encoding(path: &Path) -> io::Result<(String, Encoding)> {
 /// Bound the actual read as well as checking metadata, which can understate
 /// content size for growing files and virtual files such as procfs.
 fn read_bytes_capped(path: &Path, max_bytes: u64) -> io::Result<Vec<u8>> {
-    // Reject known special files before open can block on a FIFO. This is not
-    // a race-proof boundary against concurrent replacement of filesystem paths.
+    // Reject known special files before opening them. The handle check also
+    // covers paths replaced between this metadata call and open.
     if !std::fs::metadata(path)?.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "expected a regular file",
         ));
     }
-    let file = std::fs::File::open(path)?;
-    let metadata = file.metadata()?;
-    if !metadata.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "expected a regular file",
-        ));
-    }
-    let len = metadata.len();
+    let file = open_regular(path)?;
+    let len = file.metadata()?.len();
     if len > max_bytes {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -106,6 +99,28 @@ fn read_bytes_capped(path: &Path, max_bytes: u64) -> io::Result<Vec<u8>> {
         ));
     }
     Ok(bytes)
+}
+
+/// On Unix, a replacement FIFO must not block while we validate its handle.
+fn open_regular(path: &Path) -> io::Result<std::fs::File> {
+    #[cfg(unix)]
+    let file = {
+        use rustix::fs::{Mode, OFlags, open};
+        std::fs::File::from(open(
+            path,
+            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?)
+    };
+    #[cfg(not(unix))]
+    let file = std::fs::File::open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "expected a regular file",
+        ));
+    }
+    Ok(file)
 }
 
 /// Decode bytes as UTF-8, falling back to Windows-1252 if they are not valid
@@ -442,6 +457,53 @@ mod tests {
         // A cap above the file size reads normally.
         assert_eq!(read_text_capped(&p, 1000).unwrap().len(), 100);
     }
+    #[cfg(unix)]
+    #[test]
+    fn replacement_fifo_is_rejected_without_waiting_for_a_writer() {
+        const CHILD: &str = "M1_WORKSPACE_FIFO_REPLACEMENT_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("input");
+            std::fs::write(&path, b"regular").unwrap();
+            assert!(std::fs::metadata(&path).unwrap().is_file());
+            // Deterministically reproduce replacement after the path check.
+            std::fs::remove_file(&path).unwrap();
+            assert!(
+                std::process::Command::new("mkfifo")
+                    .arg(&path)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            assert_eq!(
+                open_regular(&path).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+            return;
+        }
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "decode::tests::replacement_fifo_is_rejected_without_waiting_for_a_writer",
+            ])
+            .env(CHILD, "1")
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("opening a replacement FIFO waited for a writer");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn read_cap_applies_when_metadata_understates_content() {

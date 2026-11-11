@@ -14,3 +14,6 @@ serde_ignored = "0.1"
 toml = "1.1"
 
 tempfile = "3.10"
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs"] }

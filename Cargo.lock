@@ -134,6 +134,7 @@ checksum = "616ec5685824bcc94416c6d4a7a446eea774a31efd7062c8480ba6fd06d7a6e5"
 name = "m1-workspace"
 version = "0.14.1"
 dependencies = [
+ "rustix",
  "serde",
  "serde_ignored",
  "tempfile",
