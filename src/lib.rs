@@ -104,7 +104,7 @@ fn pick_config(dir: &Path) -> Option<PathBuf> {
             // Skip symlinks without following them (m1-workspace#7) — a crafted
             // in-tree `parameters.m1cfg` -> host-file symlink must not divert
             // config discovery out of the project tree.
-            if e.file_type().ok()?.is_symlink() {
+            if !e.file_type().ok()?.is_file() {
                 return None;
             }
             let p = e.path();
@@ -202,7 +202,7 @@ fn walk_ext_depth(dir: &Path, ext: &str, out: &mut Vec<PathBuf>, depth: usize) {
         let p = e.path();
         if ft.is_dir() {
             walk_ext_depth(&p, ext, out, depth + 1);
-        } else if p.extension().and_then(|x| x.to_str()) == Some(ext) {
+        } else if ft.is_file() && p.extension().and_then(|x| x.to_str()) == Some(ext) {
             out.push(p);
         }
     }

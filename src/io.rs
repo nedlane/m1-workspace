@@ -12,8 +12,8 @@ use std::path::Path;
 ///
 /// The temp file is created in `path`'s parent so the final rename stays on one
 /// filesystem (a cross-filesystem rename is not atomic and would fail). The pid
-/// plus the target file name keep concurrent runs from colliding on the temp
-/// path.
+/// plus an atomic counter and exclusive creation keep concurrent writes from
+/// sharing or following an existing temp path.
 ///
 /// When `path` already exists, its Unix permission mode is preserved: the temp
 /// file (created with the umask default) is `chmod`ed to match before the rename,
@@ -24,26 +24,34 @@ pub fn atomic_write(path: &Path, contents: &[u8]) -> std::io::Result<()> {
 
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = path.file_name().map(|s| s.to_owned()).unwrap_or_default();
-    let mut tmp_name = std::ffi::OsString::from(".");
-    tmp_name.push(&file_name);
-    tmp_name.push(format!(".{}.tmp", std::process::id()));
-    let tmp = dir.join(tmp_name);
+    static NEXT_TEMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let (tmp, mut f) = loop {
+        let id = NEXT_TEMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut tmp_name = std::ffi::OsString::from(".");
+        tmp_name.push(&file_name);
+        tmp_name.push(format!(".{}.{id}.tmp", std::process::id()));
+        let tmp = dir.join(tmp_name);
+        match std::fs::File::create_new(&tmp) {
+            Ok(f) => break (tmp, f),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    };
 
     // Mode of the file being replaced, so the rewrite preserves it rather than
     // dropping back to the umask default. `None` for a new file (or a non-Unix
     // platform), where the umask default is the right behaviour.
     let existing_mode = existing_mode(path);
 
-    // Scope the file handle so it is closed before the rename; clean up the temp
-    // on any failure so a partial write never lingers.
+    // Close the file before renaming or removing it, including on Windows.
     let write_result = (|| -> std::io::Result<()> {
-        let mut f = std::fs::File::create(&tmp)?;
+        apply_mode(&f, existing_mode)?;
         f.write_all(contents)?;
         f.flush()?;
         f.sync_all()?;
-        apply_mode(&f, existing_mode)?;
         Ok(())
     })();
+    drop(f);
     if let Err(e) = write_result {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
