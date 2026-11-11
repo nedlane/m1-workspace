@@ -20,7 +20,7 @@
 //! (m1-project) use [`decode_with_encoding`] + [`encode`] to round-trip a file
 //! in its original encoding instead of silently transcoding it to UTF-8.
 
-use std::io;
+use std::io::{self, Read};
 use std::path::Path;
 
 /// The byte encoding a MoTeC file was decoded from.
@@ -49,7 +49,7 @@ pub fn read_text(path: &Path) -> io::Result<String> {
 
 /// Like [`read_text`] but with a caller-supplied size cap (in bytes). A file
 /// larger than `max_bytes` returns `ErrorKind::InvalidData` after a cheap
-/// metadata check, before any large allocation.
+/// metadata check and a bounded read, even if the file grows while being read.
 pub fn read_text_capped(path: &Path, max_bytes: u64) -> io::Result<String> {
     Ok(decode(read_bytes_capped(path, max_bytes)?))
 }
@@ -70,17 +70,42 @@ pub fn read_text_with_encoding(path: &Path) -> io::Result<(String, Encoding)> {
     )?))
 }
 
-/// Read a file's raw bytes, rejecting anything larger than `max_bytes` via a
-/// metadata pre-check so an oversized input fails fast instead of OOMing.
+/// Bound the actual read as well as checking metadata, which can understate
+/// content size for growing files and virtual files such as procfs.
 fn read_bytes_capped(path: &Path, max_bytes: u64) -> io::Result<Vec<u8>> {
-    let len = std::fs::metadata(path)?.len();
+    // Reject known special files before open can block on a FIFO. This is not
+    // a race-proof boundary against concurrent replacement of filesystem paths.
+    if !std::fs::metadata(path)?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "expected a regular file",
+        ));
+    }
+    let file = std::fs::File::open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "expected a regular file",
+        ));
+    }
+    let len = metadata.len();
     if len > max_bytes {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("file is {len} bytes, exceeding the {max_bytes}-byte read limit"),
         ));
     }
-    std::fs::read(path)
+    let mut bytes = Vec::new();
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("file exceeds the {max_bytes}-byte read limit"),
+        ));
+    }
+    Ok(bytes)
 }
 
 /// Decode bytes as UTF-8, falling back to Windows-1252 if they are not valid
@@ -416,5 +441,28 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         // A cap above the file size reads normally.
         assert_eq!(read_text_capped(&p, 1000).unwrap().len(), 100);
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn read_cap_applies_when_metadata_understates_content() {
+        let path = Path::new("/proc/version");
+        assert_eq!(std::fs::metadata(path).unwrap().len(), 0);
+        assert_eq!(
+            read_text_capped(path, 4).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn capped_reads_handle_exact_zero_and_maximum_limits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("text");
+        std::fs::write(&path, b"abcd").unwrap();
+        assert_eq!(read_text_capped(&path, 4).unwrap(), "abcd");
+        assert!(read_text_capped(&path, 3).is_err());
+        assert!(read_text_capped(&path, 0).is_err());
+        assert_eq!(read_text_capped(&path, u64::MAX).unwrap(), "abcd");
+        std::fs::write(&path, b"").unwrap();
+        assert_eq!(read_text_capped(&path, 0).unwrap(), "");
     }
 }

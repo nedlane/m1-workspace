@@ -10,48 +10,34 @@ use std::path::Path;
 /// flushed, and `fsync`ed, then renamed over `path`. On any failure the temp
 /// file is removed so a partial write never lingers.
 ///
-/// The temp file is created in `path`'s parent so the final rename stays on one
-/// filesystem (a cross-filesystem rename is not atomic and would fail). The pid
-/// plus the target file name keep concurrent runs from colliding on the temp
-/// path.
+/// The temp file is exclusively created with a unique name in `path`'s parent,
+/// so the final rename stays on one filesystem and concurrent writers do not
+/// share temporary files. Only the temporary file owned by this call is removed
+/// on failure.
 ///
-/// When `path` already exists, its Unix permission mode is preserved: the temp
-/// file (created with the umask default) is `chmod`ed to match before the rename,
-/// so a tightened mode like `0o600` is not silently widened on every rewrite. A
-/// new file keeps the usual umask default.
+/// When `path` already exists, its Unix permission mode is applied before any
+/// contents are written. A new file keeps the usual umask default.
 pub fn atomic_write(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
 
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let file_name = path.file_name().map(|s| s.to_owned()).unwrap_or_default();
-    let mut tmp_name = std::ffi::OsString::from(".");
-    tmp_name.push(&file_name);
-    tmp_name.push(format!(".{}.tmp", std::process::id()));
-    let tmp = dir.join(tmp_name);
-
-    // Mode of the file being replaced, so the rewrite preserves it rather than
-    // dropping back to the umask default. `None` for a new file (or a non-Unix
-    // platform), where the umask default is the right behaviour.
-    let existing_mode = existing_mode(path);
-
-    // Scope the file handle so it is closed before the rename; clean up the temp
-    // on any failure so a partial write never lingers.
-    let write_result = (|| -> std::io::Result<()> {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(contents)?;
-        f.flush()?;
-        f.sync_all()?;
-        apply_mode(&f, existing_mode)?;
-        Ok(())
-    })();
-    if let Err(e) = write_result {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mode = existing_mode(path);
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".m1-").suffix(".tmp");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(mode.unwrap_or(0o666)));
     }
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
+    let mut temp = builder.tempfile_in(dir)?;
+    apply_mode(temp.as_file(), mode)?;
+    temp.write_all(contents)?;
+    temp.flush()?;
+    temp.as_file().sync_all()?;
+    temp.persist(path).map_err(|error| error.error)?;
     Ok(())
 }
 
@@ -146,5 +132,64 @@ mod tests {
             .map(|e| e.file_name())
             .collect();
         assert_eq!(entries, vec![std::ffi::OsString::from("out.txt")]);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn existing_temp_links_cannot_redirect_writes() {
+        use std::os::unix::fs::symlink;
+        for hard_link in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("out");
+            let victim = dir.path().join("victim");
+            let occupied = dir.path().join(format!(".out.{}.tmp", std::process::id()));
+            fs::write(&victim, b"valuable data").unwrap();
+            if hard_link {
+                fs::hard_link(&victim, &occupied).unwrap();
+            } else {
+                symlink(&victim, &occupied).unwrap();
+            }
+            atomic_write(&path, b"replacement").unwrap();
+            assert_eq!(fs::read(&victim).unwrap(), b"valuable data");
+            assert_eq!(fs::read(&occupied).unwrap(), b"valuable data");
+            assert!(path.symlink_metadata().unwrap().is_file());
+            assert_eq!(fs::read(&path).unwrap(), b"replacement");
+        }
+    }
+
+    #[test]
+    fn preserves_occupied_temp_file_and_cleans_failed_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out");
+        let occupied = dir.path().join(format!(".out.{}.tmp", std::process::id()));
+        fs::write(&occupied, b"another writer").unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(atomic_write(&path, b"replacement").is_err());
+        assert_eq!(fs::read(&occupied).unwrap(), b"another writer");
+        assert!(path.is_dir());
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn concurrent_writes_install_whole_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out");
+        let barrier = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for value in 0..8u8 {
+                let path = &path;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    let bytes = vec![value; 65536];
+                    barrier.wait();
+                    for _ in 0..8 {
+                        atomic_write(path, &bytes).unwrap();
+                        let read = fs::read(path).unwrap();
+                        assert_eq!(read.len(), bytes.len());
+                        assert!(read.iter().all(|b| *b == read[0]));
+                    }
+                });
+            }
+        });
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 }

@@ -45,7 +45,8 @@ pub const DBC_EXT: &str = "m1dbc";
 pub const ROOT_PREFIX: &str = "Root.";
 
 /// Walk up from `start` (inclusive) through ancestor directories, returning the
-/// first directory that contains a file named `file_name`.
+/// first matching file as an absolute path. Relative starts are resolved against
+/// the current directory before walking its filesystem ancestors.
 ///
 /// Symlinks are skipped: `symlink_metadata` is used so that a symlink whose
 /// name matches `file_name` is never treated as a real project/config file,
@@ -53,7 +54,13 @@ pub const ROOT_PREFIX: &str = "Root.";
 /// prevents symlinks from diverting tree-walk discovery out of the project
 /// (m1-workspace#7).
 pub fn find_upward(start: &Path, file_name: &str) -> Option<PathBuf> {
-    let mut dir = Some(start);
+    let start = std::path::absolute(if start.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        start
+    })
+    .ok()?;
+    let mut dir = Some(start.as_path());
     while let Some(d) = dir {
         let cand = d.join(file_name);
         if let Ok(meta) = cand.symlink_metadata()
@@ -76,7 +83,13 @@ pub fn find_project_file(start: &Path) -> Option<PathBuf> {
 /// while the `.m1prj` sits in a nested subdirectory, so a single-directory search
 /// is not enough.
 pub fn find_config_file(start: &Path) -> Option<PathBuf> {
-    let mut dir = Some(start);
+    let start = std::path::absolute(if start.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        start
+    })
+    .ok()?;
+    let mut dir = Some(start.as_path());
     while let Some(d) = dir {
         if let Some(found) = pick_config(d) {
             return Some(found);
@@ -104,7 +117,7 @@ fn pick_config(dir: &Path) -> Option<PathBuf> {
             // Skip symlinks without following them (m1-workspace#7) — a crafted
             // in-tree `parameters.m1cfg` -> host-file symlink must not divert
             // config discovery out of the project tree.
-            if e.file_type().ok()?.is_symlink() {
+            if !e.file_type().ok()?.is_file() {
                 return None;
             }
             let p = e.path();
@@ -202,7 +215,7 @@ fn walk_ext_depth(dir: &Path, ext: &str, out: &mut Vec<PathBuf>, depth: usize) {
         let p = e.path();
         if ft.is_dir() {
             walk_ext_depth(&p, ext, out, depth + 1);
-        } else if p.extension().and_then(|x| x.to_str()) == Some(ext) {
+        } else if ft.is_file() && p.extension().and_then(|x| x.to_str()) == Some(ext) {
             out.push(p);
         }
     }
@@ -490,5 +503,74 @@ mod tests {
         let mut sorted = first.clone();
         sorted.sort();
         assert_eq!(first, sorted, "find_scripts must return sorted paths");
+    }
+    #[test]
+    fn config_directory_does_not_shadow_ancestor_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let child = dir.path().join("child");
+        fs::create_dir_all(child.join("parameters.m1cfg")).unwrap();
+        let expected = dir.path().join("parameters.m1cfg");
+        fs::write(&expected, "").unwrap();
+        assert_eq!(find_config_file(&child), Some(expected));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_skips_nonregular_files() {
+        use std::os::unix::net::UnixListener;
+        let dir = tempfile::tempdir().unwrap();
+        let _script = UnixListener::bind(dir.path().join("socket.m1scr")).unwrap();
+        let _dbc = UnixListener::bind(dir.path().join("socket.m1dbc")).unwrap();
+        let _cfg = UnixListener::bind(dir.path().join("parameters.m1cfg")).unwrap();
+        assert!(find_scripts(dir.path()).is_empty());
+        assert!(find_dbc_files(dir.path()).is_empty());
+        assert!(pick_config(dir.path()).is_none());
+    }
+
+    #[test]
+    fn relative_discovery_reaches_ancestors_above_cwd() {
+        const CHILD: &str = "M1_WORKSPACE_DISCOVERY_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let cwd = std::env::current_dir().unwrap();
+            let root = cwd.parent().unwrap();
+            for start in [
+                Path::new("."),
+                Path::new(""),
+                Path::new("nested"),
+                cwd.as_path(),
+            ] {
+                assert_eq!(find_project_file(start).unwrap(), root.join(PROJECT_FILE));
+                assert_eq!(
+                    find_config_file(start).unwrap(),
+                    root.join("parameters.m1cfg")
+                );
+                assert_eq!(
+                    M1ToolsConfig::discover(start).unwrap().format.line_width,
+                    Some(77)
+                );
+            }
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let child = dir.path().join("child");
+        fs::create_dir_all(child.join("nested")).unwrap();
+        fs::write(dir.path().join(PROJECT_FILE), "").unwrap();
+        fs::write(dir.path().join("parameters.m1cfg"), "").unwrap();
+        fs::write(
+            dir.path().join(TOOLS_CONFIG_FILE),
+            "[format]\nline_width = 77\n",
+        )
+        .unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::relative_discovery_reaches_ancestors_above_cwd",
+                "--nocapture",
+            ])
+            .current_dir(child)
+            .env(CHILD, "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
     }
 }
